@@ -1,0 +1,25 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/vireon-duplex/client-sdk.git"
+authors = ["vireon-duplex"]
+license = "GNU AFFERO GENERAL PUBLIC LICENSE v3.0"
+
+[workspace]
+members = ["client-sdk", "vireon-cli"]
+resolver = "2"
+
+[workspace.lints]
+rust = {}
+clippy = { "unwrap_used" = "deny", "expect_used" = "deny", "panic" = "deny", "todo" = "deny", "unimplemented" = "deny", "unreachable" = "deny", "dbg_macro" = "deny", "print_stdout" = "deny", "print_stderr" = "deny" }
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+quiche = "0.22"
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

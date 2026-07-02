@@ -1,0 +1,21 @@
+# docker-compose.yml — Vireon CLI
+#
+# Profile-gated: does NOT start with `docker compose up`.
+# Use for one-shot CLI commands against an external Vireon server:
+#
+#   docker compose run --rm cli ping
+#   docker compose run --rm cli sub "sensor.*" --count 10
+#   docker compose run --rm cli pub sensor.temp "23.5C"
+#
+# Set VIREON_ADDR in .env or your shell to point at your server:
+#   echo 'VIREON_ADDR=vireon.example.com:4433' > .env
+
+services:
+  cli:
+    build: .
+    entrypoint: ["/usr/local/bin/vireon"]
+    environment:
+      VIREON_ADDR: "${VIREON_ADDR:-127.0.0.1:4433}"
+      VIREON_TLS_VERIFY: "${VIREON_TLS_VERIFY:-danger_accept_invalid}"
+    profiles:
+      - cli
