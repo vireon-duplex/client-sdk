@@ -128,24 +128,37 @@ impl Transport {
 
     /// Read all currently-available datagrams and feed them to quiche.
     /// `WouldBlock` (no more datagrams) is the normal termination.
-    pub(crate) fn drain_recv(&mut self) {
+    /// Returns `true` if at least one datagram was received.
+    pub(crate) fn drain_recv(&mut self) -> bool {
+        let mut got_data = false;
         loop {
             match self.sock.try_recv_from(&mut self.recv_buf) {
                 Ok((n, from)) => {
+                    got_data = true;
                     let info = quiche::RecvInfo { from, to: self.local };
                     match self.conn.recv(&mut self.recv_buf[..n], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "[transport] quiche recv error");
-                            return;
+                            return got_data;
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return got_data,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Connected-UDP ICMP port-unreachable: the peer process was
+                // killed (no graceful CONNECTION_CLOSE). Close the quiche
+                // connection so is_closed() returns true and the reconnect
+                // FSM fires immediately instead of waiting for the 30s idle
+                // timeout.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tracing::info!("[transport] peer unreachable (connection refused)");
+                    let _ = self.conn.close(true, 0x00, b"peer unreachable");
+                    return got_data;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "[transport] socket recv error");
-                    return;
+                    return got_data;
                 }
             }
         }

@@ -18,6 +18,7 @@
 //!   no pattern matching, which is what gives them head-of-line isolation.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use frame::codec::FrameHeader;
@@ -35,6 +36,12 @@ use crate::DeliveryPolicy;
 
 /// Depth of the command channel between [`Client`] handles and the task.
 pub(crate) const CMD_CHANNEL_CAP: usize = 256;
+
+/// Maximum commands processed per outer-loop iteration. Without this cap,
+/// a `try_publish` flood monopolises the worker thread inside the batch
+/// drain loop, starving other tasks (notably the subscriber's connection
+/// task on the same tokio worker).
+const MAX_CMD_BATCH: usize = 64;
 
 /// QUIC stream id used for the shared default pub/sub channel. The first
 /// client-initiated bidirectional stream is 0; dedicated streams start at
@@ -175,6 +182,33 @@ impl Client {
             .await
             .map_err(|_| PublishError::NotConnected)?;
         resp_rx.await.map_err(|_| PublishError::NotConnected)?
+    }
+
+    /// Fire-and-forget publish — enqueues the frame without waiting for the
+    /// connection task to confirm.  This avoids the per-publish oneshot
+    /// round-trip (which costs ~2 ms of scheduler latency) and is the right
+    /// choice for high-throughput publishing where the caller does not need
+    /// per-message confirmation.
+    ///
+    /// Returns `Err(NotConnected)` only when the command channel is full or
+    /// the connection task has exited.  The actual frame encode + send
+    /// happens asynchronously in the background.
+    ///
+    /// # Errors
+    /// [`PublishError::NotConnected`] if the connection is gone or the
+    /// command channel is full.
+    pub fn try_publish(&self, topic: &str, payload: impl crate::message::Payload) -> Result<(), PublishError> {
+        let payload: Bytes = payload.into_bytes();
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::Publish {
+            topic: topic.to_string(),
+            payload,
+            stream: StreamSel::Default,
+            resp: resp_tx,
+        };
+        self.tx
+            .try_send(cmd)
+            .map_err(|_| PublishError::NotConnected)
     }
 
     /// Open a dedicated stream with its own delivery policy and (optional)
@@ -376,10 +410,12 @@ impl TaskState {
         let buf = encode_publish(topic, payload);
         let header = FrameHeader::new(StreamId::new(sid), MessageType::Publish)
             .with_seq(self.next_seq(sid));
+        // Bytes land in quiche's per-stream send buffer; the outer run() loop
+        // flushes once per iteration. Skipping a per-publish flush here is what
+        // makes batch publishes share a single UDP send syscall.
         transport
             .send_frame(header, &buf, sid)
             .map_err(|_| PublishError::NotConnected)?;
-        transport.flush().map_err(|_| PublishError::NotConnected)?;
         Ok(())
     }
 
@@ -560,9 +596,28 @@ pub(crate) async fn run(
 
     let mut state = TaskState::new(cfg.subscriber_buffer, cfg.max_message_size, cmd_tx);
 
+    // Dead-peer detection: quiche 0.22 has no built-in keepalive and ICMP
+    // port-unreachable is not reliably surfaced on loopback. So we use a
+    // dual approach:
+    //
+    // 1. Heartbeat: send a Subscribe every 1 s to elicit server ACKs.
+    // 2. Idle check: if no datagram received for HEARTBEAT_TIMEOUT (3 s),
+    //    force-close the quiche connection so the reconnect FSM fires.
+    //
+    // A live server ACKs every heartbeat, keeping last_recv fresh. A dead
+    // server stops ACKing, and after 3 s the idle check fires.
+    const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick (fires at t=0).
+    heartbeat.tick().await;
+    let mut last_recv = Instant::now();
+
     loop {
         // 1. Drain socket → quiche.
-        transport.drain_recv();
+        if transport.drain_recv() {
+            last_recv = Instant::now();
+        }
         // 2. Decode + route any complete frames.
         transport.process_readable(|sid, frame| state.dispatch(sid, frame));
         // 3. Flush pending output.
@@ -570,10 +625,22 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "[client] flush error");
         }
 
-        // 4. Connection teardown? Try reconnect per the configured policy.
+        // 4. Dead-peer detection: if no data received for HEARTBEAT_TIMEOUT,
+        //    the server is presumed dead. Force-close so is_closed() returns
+        //    true and the reconnect FSM fires.
+        if !transport.is_closed() && last_recv.elapsed() > HEARTBEAT_TIMEOUT {
+            tracing::info!(
+                idle = ?last_recv.elapsed(),
+                "[client] no data from server — closing for reconnect"
+            );
+            transport.close();
+        }
+
+        // 5. Connection teardown? Try reconnect per the configured policy.
         if transport.is_closed() {
             if let Some(new_t) = reconnect(&cfg, &mut rx).await {
                 transport = new_t;
+                last_recv = Instant::now();
                 tracing::info!("[client] reconnected — replaying subscriptions");
                 state.replay_all(&mut transport);
                 continue;
@@ -582,14 +649,52 @@ pub(crate) async fn run(
             break;
         }
 
-        // 5. Wait for the next event: a command, socket readability, or a timer.
+        // 6. Wait for the next event: a command, socket readability, or a timer.
         let next = transport.next_event_deadline(None);
         tokio::select! {
             biased;
+            _ = heartbeat.tick() => {
+                // Dead-peer probe: send a Subscribe for a private topic on
+                // the default stream. This generates outgoing QUIC traffic
+                // that elicits an ACK from a live server. If no ACK arrives
+                // within HEARTBEAT_TIMEOUT, the idle check below closes the
+                // connection for reconnect.
+                // Two-segment topic to satisfy the server's default ACL
+                // (`allow("*.*", None, ALL)`).  The server sends a response
+                // regardless of whether the subscribe is accepted or denied,
+                // so this still elicits traffic for dead-peer detection.
+                let buf = encode_subscribe("_heartbeat.probe", 0);
+                let header = FrameHeader::new(StreamId::new(DEFAULT_STREAM), MessageType::Subscribe)
+                    .with_seq(state.next_seq(DEFAULT_STREAM));
+                if let Err(e) = transport.send_frame(header, &buf, DEFAULT_STREAM) {
+                    tracing::warn!(error = %e, "[client] heartbeat send failed");
+                }
+            }
             cmd = rx.recv() => {
                 match cmd {
                     Some(c) => {
-                        let exit = state.handle_cmd(c, &mut transport);
+                        let mut exit = state.handle_cmd(c, &mut transport);
+                        // Drain additional commands already queued so they
+                        // share the next flush — amortises the UDP send syscall.
+                        // Cap at MAX_CMD_BATCH to avoid monopolising the worker
+                        // thread when publishers flood the channel via
+                        // `try_publish`; without the cap, a 15 k msg/s burst
+                        // blocks the task for ~15 ms, starving the subscriber's
+                        // connection task on the same worker.
+                        let mut batch = 1;
+                        while !exit && batch < MAX_CMD_BATCH {
+                            match rx.try_recv() {
+                                Ok(c) => {
+                                    exit = state.handle_cmd(c, &mut transport);
+                                    batch += 1;
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    transport.close();
+                                    return;
+                                }
+                            }
+                        }
                         if exit {
                             break;
                         }
@@ -603,7 +708,7 @@ pub(crate) async fn run(
             }
             _ = transport.wait_for_event(next) => {}
         }
-        // 6. If we slept past the quiche deadline, fire loss-recovery timers.
+        // 7. If we slept past the quiche deadline, fire loss-recovery timers.
         if std::time::Instant::now() >= next {
             transport.fire_timeout();
         }

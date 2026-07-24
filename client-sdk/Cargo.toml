@@ -6,6 +6,7 @@ repository.workspace = true
 authors.workspace = true
 license.workspace = true
 autobenches = false
+autoexamples = false
 description = "Production-grade async client SDK for the Vireon QUIC-native pub/sub runtime."
 readme = "README.md"
 
@@ -44,6 +45,25 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 rcgen = "0.13"
 tracing-subscriber = { workspace = true }
+
+# Explicit example list: anything under examples/ that is NOT listed here is
+# treated as a path-include-only module (e.g. _bench_common.rs is a shared
+# helper, not a standalone binary).
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"
+
+[[example]]
+name = "s07_hol_congestion"
+path = "examples/s07_hol_congestion.rs"
+
+[[example]]
+name = "s09_reconnect"
+path = "examples/s09_reconnect.rs"
+
+[[example]]
+name = "s11_ordering"
+path = "examples/s11_ordering.rs"
 
 [lints]
 workspace = true
