@@ -218,15 +218,85 @@ the SDK logs and resets that stream's decoder only.
 
 ## Examples
 
-The crate ships an end-to-end demo:
+The crate ships a quickstart demo and a growing suite of benchmark
+scenarios that prove specific data-plane guarantees against a real
+`quic-server`. Every scenario auto-spawns its own server on an ephemeral
+port — just `cargo run` and watch.
+
+### Quickstart
 
 ```text
-cargo run -p vireon-sdk --example quickstart
+cargo run -p vireon-sdk --release --example quickstart
 ```
 
-See [`examples/quickstart.rs`](examples/quickstart.rs) — two clients
-(subscriber + publisher), default channel + a dedicated LatestOnly
-stream, ~25 lines each.
+Two clients (subscriber + publisher), default channel + a dedicated
+`LatestOnly` stream, ~25 lines each. Requires a server running on
+`127.0.0.1:4433`.
+
+### Benchmark scenarios
+
+| Scenario | Run | Proves |
+|----------|-----|--------|
+| **s07** HOL isolation | `cargo run -p vireon-sdk --release --example s07_hol_congestion` | 5 dedicated streams (video 16 KiB @ ~2 MiB/s + audio/events/rpc/telem) — video congestion never degrades the lighter streams |
+| **s09** Reconnect + resubscribe | `cargo run -p vireon-sdk --release --example s09_reconnect` | Server is killed mid-session; the SDK detects peer death, reconnects with backoff, replays all subscriptions, and delivery resumes in <5 s |
+| **s11** Sequence integrity | `cargo run -p vireon-sdk --release --example s11_ordering` | 500 frames on a `ReliableOrdered` dedicated stream — every frame received exactly once, in ascending order, zero gaps |
+
+All scenarios use the shared helper module
+[`examples/_bench_common.rs`](examples/_bench_common.rs) (self-signed
+cert generation, `ServerGuard` RAII, latency histogram, formatted
+output). The helper is `#[path]`-included by each scenario and is **not**
+a standalone binary — `autoexamples = false` in `Cargo.toml` keeps cargo
+from trying to compile it.
+
+#### s07 — Head-of-line blocking isolation
+
+The headline Vireon differentiator proof. One subscriber opens 5
+dedicated QUIC streams; one publisher fires 5 workloads on the default
+channel. The `video` stream carries 75 % of the byte load (16 KiB
+frames at ~2 MiB/s); the other four stay at 100 % delivery with stable
+p99 latency (~2 ms):
+
+```text
+video    LatestOnly        134/s  100.0%  2.09 MiB/s  ⚠ heaviest
+audio    ReliableOrdered   134/s  100.0%  536 KiB/s   ✓ healthy
+events   RealtimeDropOld   134/s  100.0%  67 KiB/s    ✓ healthy
+rpc      ReliableOrdered   134/s  100.0%  34 KiB/s    ✓ healthy
+telem    LatestOnly        134/s  100.0%  8 KiB/s     ✓ healthy
+✓ HOL ISOLATION VERIFIED
+```
+
+#### s09 — Reconnect + resubscribe FSM
+
+Publishes on a `ReliableOrdered` dedicated stream, kills the server
+process, starts a fresh server on the same port, and verifies the SDK's
+background task reconnects + replays subscriptions automatically:
+
+```text
+Phase 1: published 478, received 478
+⟳ killing server — reconnect FSM should fire…
+server back up after 1.6 s
+Phase 2: published 477, received 477
+✓ RECONNECT VERIFIED
+```
+
+Dead-peer detection uses a 1-second heartbeat probe (quiche 0.22 has no
+built-in keepalive) plus a 3-second idle timeout — a killed server is
+detected in ~3 s instead of waiting for QUIC's 30 s idle timer.
+
+#### s11 — Sequence integrity
+
+Publishes 500 numbered frames on a `ReliableOrdered` dedicated stream
+and verifies the subscriber receives every frame exactly once, in
+ascending order, with no gaps:
+
+```text
+published:   500
+received:    500
+gaps:        0
+duplicates:  0
+out-of-order: 0
+✓ SEQUENCE INTEGRITY VERIFIED
+```
 
 ## Tests
 
