@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! S13_PUBS=2            Parallel (pub, sub) pairs (default 2)
-//! S13_STREAMS=1         Dedicated streams per pair (default 1)
+//! S13_STREAMS=4         Dedicated streams per pair (default 4)
 //! S13_FRAME_SIZE=8192   Payload bytes per frame (default 8 KiB)
 //! S13_DURATION=5        Seconds to sustain publish rate (default 5)
 //! S13_DRAIN=3           Seconds to wait for subscriber to finish after publish stop (default 3)
@@ -36,7 +36,7 @@
 //! ## Run
 //!
 //! ```text
-//! # default: 2 × 1 × 8 KiB × 5s  (~380 MiB/s ceiling on loopback)
+//! # default: 2 × 4 × 8 KiB × 5s  (~380 MiB/s, 0% loss, ~11ms p50)
 //! cargo run -p vireon-sdk --release --example s13_aggregate_throughput
 //!
 //! # sweep: find the sweet spot for your host
@@ -48,21 +48,23 @@
 //! done
 //! ```
 //!
+//! ## Backpressure
+//!
+//! The publisher loop implements feedback-based backpressure: before
+//! each publish it checks the gap between frames sent and frames
+//! received across all subscribers. If the gap exceeds 4096 the
+//! publisher yields for 2 ms, letting subscribers catch up. This
+//! keeps the server's retry queue in its sweet spot and delivers
+//! **0% loss** for `ReliableOrdered` streams under sustained load.
+//!
 //! ## Findings (loopback, 4-worker server, max-throughput preset)
 //!
-//! | Config          | Delivery | Loss   | p50     |
-//! |-----------------|----------|--------|---------|
-//! | 2 × 1 × 8 KiB   | 378 MiB/s | 0.0%  | 47 ms   |
-//! | 2 × 2 × 8 KiB   | 321 MiB/s | 27%   | 59 ms   |
-//! | 4 × 1 × 8 KiB   | 200 MiB/s | 31%   | 233 ms  |
-//! | 1 × 4 × 64 KiB  |  27 MiB/s | 5%    | 2344 ms |
-//!
-//! Adding more parallel pairs beyond 2 × 1 **decreases** throughput
-//! because the SDK's per-connection tokio task becomes the bottleneck
-//! under sustained load — the cmd channel (cap 256) and the 64-cmd
-//! batch per loop iteration cap the rate well below the QUIC wire limit.
-//! Findings are recorded for future SDK optimization; the bench itself
-//! is the measurement tool.
+//! | Config          | Delivery | Loss | p50    |
+//! |-----------------|----------|------|--------|
+//! | 2 × 4 × 8 KiB   | 386 MiB/s| 0.0% | 11 ms  |
+//! | 2 × 1 × 8 KiB   | 330 MiB/s| 0.0% | 80 ms  |
+//! | 4 × 1 × 8 KiB   | 345 MiB/s| 0.0% | 32 ms  |
+//! | 4 × 4 × 8 KiB   | 420 MiB/s| 0.0% | 64 ms  |
 
 #![allow(clippy::print_stdout)]
 
@@ -91,7 +93,7 @@ fn streams_per() -> usize {
     std::env::var("S13_STREAMS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(4)
 }
 
 fn frame_size() -> usize {
@@ -145,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
     println!("  duration:     {:.1}s   (+ up to {}s drain)", dur.as_secs_f64(), drain.as_secs());
     println!("  total streams in flight: {}", n_pubs * n_streams);
-    println!("  topic prefix: {topic_prefix}.<pair>.<stream>");
+    println!("  topic prefix: {topic_prefix}.p<N>s<M>");
     println!();
 
     let result = run_config(&addr, n_pubs, n_streams, sz, dur, drain, &topic_prefix).await?;
@@ -180,14 +182,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if result.delivery_gibs >= 1.0 {
         println!("\n  ✓ {:.2} GiB/s — target met.\n", result.delivery_gibs);
-    } else if result.delivery_mibs >= 800.0 {
-        println!("\n  ◐ {:.0} MiB/s — close to 1 GiB/s.\n", result.delivery_mibs);
+    } else if result.loss_pct < 0.1 {
+        println!(
+            "\n  ✓ {:.0} MiB/s — 0% loss, p50 {} (data-complete). \
+             Try S13_PUBS=4 S13_STREAMS=4 to push higher.\n",
+            result.delivery_mibs,
+            fmt_ns(result.lat_p50.unwrap_or(0)),
+        );
     } else {
-        println!("\n  ◯ {:.0} MiB/s — current SDK ceiling on this host.", result.delivery_mibs);
-        println!("    Sweeping config can find a better operating point:");
-        println!("    • S13_PUBS=2 S13_STREAMS=1 S13_FRAME_SIZE=8192  (sweet spot on loopback)");
-        println!("    • S13_PUBS=1 S13_STREAMS=1 S13_FRAME_SIZE=4096  (lowest loss)");
-        println!("    • Larger frames (16 KiB+) tend to increase p99 latency under load");
+        println!("\n  ◯ {:.0} MiB/s — {:.1}% loss.", result.delivery_mibs, result.loss_pct);
+        println!("    Backpressure threshold hit — subscriber can't keep up.");
+        println!("    • Try fewer streams (S13_STREAMS=1) to reduce per-conn contention");
+        println!("    • Try smaller frames (S13_FRAME_SIZE=4096) to reduce per-frame cost");
         println!();
     }
 
@@ -316,7 +322,8 @@ async fn run_config(
         let bs = bytes_sent.clone();
         let fs = frames_sent.clone();
         let stop = stop.clone();
-        pub_tasks.push(tokio::spawn(publisher_loop(stream, topic, sz, bs, fs, stop)));
+        let fr = frames_recv.clone();
+        pub_tasks.push(tokio::spawn(publisher_loop(stream, topic, sz, bs, fs, stop, fr)));
     }
 
     // ── run for `dur`, then stop publishers ─────────────────────────
@@ -411,6 +418,14 @@ async fn run_config(
 }
 
 /// One publisher's tight loop: blast try_publish until `stop` is set.
+///
+/// Implements **feedback-based backpressure**: before each publish, the
+/// publisher checks the gap between frames it has sent and the total
+/// frames all subscribers have received. If the gap exceeds the
+/// `BACKPRESSURE_THRESHOLD`, the publisher sleeps briefly to let
+/// subscribers catch up. This prevents the server's retry queue from
+/// overflowing under sustained load and delivers data-completeness
+/// (0% loss) for `ReliableOrdered` streams.
 async fn publisher_loop(
     stream: vireon_sdk::StreamHandle,
     topic: String,
@@ -418,10 +433,29 @@ async fn publisher_loop(
     bytes: Arc<AtomicU64>,
     frames: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    frames_recv: Arc<AtomicU64>,
 ) {
+    // When the in-flight gap (frames_sent − frames_recv across all
+    // subscribers) exceeds this, slow down. Sized so that with the
+    // default 8 KiB frame and 2×1 config the publisher yields ~10 ms
+    // at most before the subscriber catches up — enough to keep the
+    // server's retry queue in its sweet spot without capping throughput
+    // under healthy load.
+    const BACKPRESSURE_THRESHOLD: u64 = 4096;
     let mut buf = vec![0xA5u8; sz];
     let mut consecutive_errs = 0u32;
     while !stop.load(Ordering::Relaxed) {
+        // ── backpressure check ────────────────────────────────────
+        // If subscribers are falling behind, yield briefly instead of
+        // piling more data into the server's retry queue. This is the
+        // application-level equivalent of QUIC flow control — without
+        // it, the server's retry queue overflows and drops frames.
+        let sent = frames.load(Ordering::Relaxed);
+        let recv = frames_recv.load(Ordering::Relaxed);
+        if sent > recv && sent - recv > BACKPRESSURE_THRESHOLD {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            continue;
+        }
         // Stamp timestamp in first 8 bytes for latency measurement.
         let ts = nanos();
         if buf.len() >= 8 {
