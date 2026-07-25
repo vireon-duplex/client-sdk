@@ -21,7 +21,7 @@ use frame::codec::{Frame, FrameDecoder};
 use quiche::Connection;
 use tokio::net::UdpSocket;
 
-use crate::config::{ClientConfig, TlsVerify};
+use crate::config::{ClientConfig, ClientIdentity, TlsVerify};
 use crate::error::ConnectError;
 
 /// ALPN protocol the client offers. The server advertises
@@ -74,7 +74,7 @@ impl Transport {
         // lookups on the hot path) and so ICMP errors surface on recv.
         sock.connect(peer).await?;
 
-        let mut qcfg = build_quiche_config(&cfg.tls, cfg.idle_timeout)?;
+        let mut qcfg = build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
         let scid = quiche::ConnectionId::from_vec(gen_scid());
         let conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
 
@@ -415,10 +415,35 @@ impl Transport {
 // ── quiche config ──────────────────────────────────────────────────
 
 /// Build a `quiche::Config` matching the demo client's transport settings and
-/// applying the requested [`TlsVerify`] policy.
-fn build_quiche_config(tls: &TlsVerify, idle_timeout: Duration) -> Result<quiche::Config, ConnectError> {
+/// applying the requested [`TlsVerify`] policy plus optional client identity.
+fn build_quiche_config(
+    tls: &TlsVerify,
+    idle_timeout: Duration,
+    client_identity: Option<&ClientIdentity>,
+) -> Result<quiche::Config, ConnectError> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.set_application_protos(&[ALPN])?;
+
+    // ── Client identity (mTLS) ─────────────────────────────────────
+    // Loaded before verify_peer so the cert chain is ready when the
+    // handshake starts. Independent of TlsVerify: a client can both
+    // pin the server cert (Strict/Pinned) and present its own.
+    if let Some(id) = client_identity {
+        let cert_str = id
+            .cert
+            .to_str()
+            .ok_or_else(|| ConnectError::Tls(format!("cert path not valid UTF-8: {}", id.cert.display())))?;
+        let key_str = id
+            .key
+            .to_str()
+            .ok_or_else(|| ConnectError::Tls(format!("key path not valid UTF-8: {}", id.key.display())))?;
+        config
+            .load_cert_chain_from_pem_file(cert_str)
+            .map_err(|e| ConnectError::Tls(format!("failed to load client cert: {e}")))?;
+        config
+            .load_priv_key_from_pem_file(key_str)
+            .map_err(|e| ConnectError::Tls(format!("failed to load client key: {e}")))?;
+    }
     // The effective idle timeout is min(client, server). The server default
     // is 30 s; honour the user's request but never go below 1 s to avoid
     // pathologically aggressive teardowns on slow links.
