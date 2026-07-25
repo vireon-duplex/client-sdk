@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bench_common::{init_tracing, resolve_server};
-use vireon_sdk::{ClientBuilder, DeliveryPolicy, StreamSpec, TlsVerify};
+use vireon_sdk::{ClientBuilder, DeliveryPolicy, StreamHandle, StreamSpec, TlsVerify};
 
 const BURST: u64 = 200;
 
@@ -107,33 +107,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // ── 3. burst: publish BURST frames on each dedicated stream ──────
-    println!("\n[publish] sending {BURST} frames per stream…");
+    // ── 3. burst: publish BURST frames per stream in parallel ───────
+    //
+    // Each topic gets its OWN dedicated QUIC stream on the publisher side
+    // → independent flow control → a slow or blocked stream never stalls
+    // the others. Three tokio tasks run concurrently, each calling
+    // try_publish on its own StreamHandle.
+    println!("\n[publish] sending {BURST} frames per stream (parallel, per-stream QUIC flow control)…");
 
-    let pub_task = tokio::spawn({
-        let client = pub_client.clone();
-        async move {
-            let mut buf = [0u8; 16];
-            for seq in 0..BURST {
-                buf[8..16].copy_from_slice(&seq.to_be_bytes());
+    let pub_data = pub_client
+        .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("qs.data"))
+        .await
+        .expect("open pub ReliableOrdered");
+    let pub_cursor = pub_client
+        .open_stream(StreamSpec::new(DeliveryPolicy::LatestOnly).with_topic("qs.cursor"))
+        .await
+        .expect("open pub LatestOnly");
+    let pub_events = pub_client
+        .open_stream(StreamSpec::new(DeliveryPolicy::RealtimeDropOld).with_topic("qs.events"))
+        .await
+        .expect("open pub RealtimeDropOld");
 
-                // try_publish avoids the per-publish oneshot round-trip
-                // that publish().await costs (≈3 ms scheduler latency).
-                // On backpressure (channel full), yield to let the
-                // connection task drain. Timestamp is re-stamped on
-                // each attempt so the measured latency reflects only
-                // the real network + server path, not queueing delay.
-                for topic in ["qs.data", "qs.cursor", "qs.events"] {
-                    loop {
-                        let ts = nanos();
-                        buf[0..8].copy_from_slice(&ts.to_be_bytes());
-                        match client.try_publish(topic, &buf) {
-                            Ok(()) => break,
-                            Err(_) => tokio::task::yield_now().await,
-                        }
-                    }
-                }
-            }
+    println!(
+        "[publish] dedicated streams opened (ids {}, {}, {})",
+        pub_data.stream_id(),
+        pub_cursor.stream_id(),
+        pub_events.stream_id(),
+    );
+
+    let pub_task = tokio::spawn(async move {
+        let tasks = vec![
+            tokio::spawn(publish_burst(pub_data, "qs.data", BURST)),
+            tokio::spawn(publish_burst(pub_cursor, "qs.cursor", BURST)),
+            tokio::spawn(publish_burst(pub_events, "qs.events", BURST)),
+        ];
+        for t in tasks {
+            let _ = t.await;
         }
     });
 
@@ -171,6 +180,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────
+
+async fn publish_burst(stream: StreamHandle, topic: &'static str, burst: u64) {
+    let mut buf = [0u8; 16];
+    for seq in 0..burst {
+        buf[8..16].copy_from_slice(&seq.to_be_bytes());
+        loop {
+            // Re-stamp timestamp on each retry so latency reflects only the
+            // real network path, not the time spent waiting for backpressure.
+            let ts = nanos();
+            buf[0..8].copy_from_slice(&ts.to_be_bytes());
+            match stream.try_publish(topic, &buf) {
+                Ok(()) => break,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+}
 
 struct Stats {
     count: u64,
