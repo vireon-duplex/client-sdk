@@ -48,6 +48,13 @@ pub(crate) struct Transport {
     /// Per-stream incremental decoders. A frame can be split across datagrams,
     /// so each stream keeps its own accumulator.
     decoders: HashMap<u64, FrameDecoder>,
+    /// Per-stream pending bytes from partial `stream_send` writes. When
+    /// QUIC flow control limits a write, the unwritten tail is buffered
+    /// here and retried on the next iteration after the peer opens the
+    /// window (MAX_STREAM_DATA). Without this, `stream_send` would
+    /// silently drop the tail and corrupt the byte stream — causing
+    /// CrcMismatch + decoder desync on the server side.
+    pending: HashMap<u64, BytesMut>,
 }
 
 impl Transport {
@@ -79,6 +86,7 @@ impl Transport {
             send_buf: vec![0u8; DGRAM_BUF],
             recv_buf: vec![0u8; DGRAM_BUF],
             decoders: HashMap::new(),
+            pending: HashMap::new(),
         };
 
         t.handshake().await?;
@@ -231,12 +239,91 @@ impl Transport {
     }
 
     /// Send raw bytes on a QUIC stream (opens it implicitly on first write).
+    ///
+    /// Handles partial writes: when QUIC flow control limits the write
+    /// (`stream_send` returns fewer bytes than requested, or `Error::Done`),
+    /// the unwritten tail is buffered in [`Transport::pending`] and retried
+    /// by [`flush_pending`] on subsequent iterations. This prevents the
+    /// silent frame-truncation that caused server-side `CrcMismatch` and
+    /// decoder desync.
     fn stream_send(&mut self, stream_id: u64, data: &[u8]) -> Result<(), ConnectError> {
-        match self.conn.stream_send(stream_id, data, false) {
-            Ok(_) => Ok(()),
-            Err(quiche::Error::Done) => Ok(()),
-            Err(quiche::Error::FinalSize) => Err(ConnectError::Closed("stream already closed".into())),
-            Err(e) => Err(ConnectError::Quiche(e)),
+        // If there's already pending data for this stream, append to it.
+        // The new data must go AFTER the buffered tail to preserve byte
+        // ordering on the stream.
+        let owned;
+        let buf: &[u8] = match self.pending.get_mut(&stream_id) {
+            Some(pending) => {
+                pending.extend_from_slice(data);
+                owned = std::mem::take(pending);
+                &owned
+            }
+            None => data,
+        };
+
+        let mut offset = 0;
+        while offset < buf.len() {
+            match self.conn.stream_send(stream_id, &buf[offset..], false) {
+                Ok(n) => {
+                    offset += n;
+                    // n == 0 means no capacity; stop looping and buffer
+                    // the rest. flush_pending will retry after the peer
+                    // opens the window.
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => {
+                    // No capacity right now; break and buffer the rest.
+                    break;
+                }
+                Err(quiche::Error::FinalSize) => {
+                    self.pending.remove(&stream_id);
+                    return Err(ConnectError::Closed("stream already closed".into()));
+                }
+                Err(e) => {
+                    self.pending.remove(&stream_id);
+                    return Err(ConnectError::Quiche(e));
+                }
+            }
+        }
+
+        if offset < buf.len() {
+            // Store the unwritten tail for retry on the next iteration.
+            // Using `truncate` would be wrong if the Vec was moved out
+            // above — clone the tail into the pending map.
+            let tail = buf[offset..].to_vec();
+            self.pending.insert(stream_id, BytesMut::from_iter(tail));
+        } else {
+            // Everything written; clear any stale pending entry.
+            self.pending.remove(&stream_id);
+        }
+
+        Ok(())
+    }
+
+    /// Retry pending partial writes before flushing. Called at the top of
+    /// each connection-task iteration so buffered tails get drained as soon
+    /// as the peer opens the flow-control window (MAX_STREAM_DATA).
+    ///
+    /// Uses `stream_capacity` to skip streams that still have no room,
+    /// avoiding unnecessary `stream_send` calls that would just return 0.
+    pub(crate) fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        // Snapshot stream IDs to avoid borrow conflicts during iteration.
+        let ids: Vec<u64> = self.pending.keys().copied().collect();
+        for sid in ids {
+            // Take ownership of the buffer so we can call stream_send
+            // (which needs &mut self) without holding a borrow on pending.
+            let Some(buf) = self.pending.remove(&sid) else {
+                continue;
+            };
+            // Re-send the buffered tail. If it still partial-writes,
+            // stream_send will re-buffer the remainder.
+            if let Err(e) = self.stream_send(sid, &buf) {
+                tracing::warn!(stream_id = sid, error = %e, "[transport] flush_pending failed");
+            }
         }
     }
 

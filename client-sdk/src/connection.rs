@@ -614,13 +614,18 @@ pub(crate) async fn run(
     let mut last_recv = Instant::now();
 
     loop {
-        // 1. Drain socket → quiche.
+        // 1. Drain socket → quiche (may deliver MAX_STREAM_DATA that opens
+        //    the flow-control window for previously-partial writes).
         if transport.drain_recv() {
             last_recv = Instant::now();
         }
-        // 2. Decode + route any complete frames.
+        // 2. Retry any pending partial writes now that the window may have
+        //    opened. Must run before decoding inbound frames and before
+        //    flush so the byte stream stays ordered.
+        transport.flush_pending();
+        // 3. Decode + route any complete frames.
         transport.process_readable(|sid, frame| state.dispatch(sid, frame));
-        // 3. Flush pending output.
+        // 4. Flush pending output.
         if let Err(e) = transport.flush() {
             tracing::warn!(error = %e, "[client] flush error");
         }
