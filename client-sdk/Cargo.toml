@@ -62,6 +62,10 @@ name = "s09_reconnect"
 path = "examples/s09_reconnect.rs"
 
 [[example]]
+name = "s10_mtls"
+path = "examples/s10_mtls.rs"
+
+[[example]]
 name = "s11_ordering"
 path = "examples/s11_ordering.rs"
 
