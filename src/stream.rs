@@ -119,4 +119,36 @@ impl StreamHandle {
             .map_err(|_| PublishError::NotConnected)?;
         resp_rx.await.map_err(|_| PublishError::NotConnected)?
     }
+
+    /// Fire-and-forget publish on this dedicated stream — enqueues the
+    /// frame without waiting for the connection task to confirm.
+    ///
+    /// Avoids the per-publish oneshot round-trip (~3 ms scheduler latency)
+    /// that `publish().await` costs. On a full command channel, returns
+    /// `Err(NotConnected)` — the caller should `yield_now().await` and
+    /// retry, or use `publish().await` for built-in backpressure.
+    ///
+    /// Because each dedicated stream has its own QUIC flow-control budget,
+    /// concurrent `try_publish` calls on different `StreamHandle`s do NOT
+    /// block each other at the transport layer.
+    ///
+    /// # Errors
+    /// [`PublishError::NotConnected`] if the connection is gone or the
+    /// command channel is full.
+    pub fn try_publish(
+        &self,
+        topic: &str,
+        payload: impl crate::message::Payload,
+    ) -> Result<(), PublishError> {
+        let payload: Bytes = payload.into_bytes();
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .try_send(ConnCmd::Publish {
+                topic: topic.to_string(),
+                payload,
+                stream: StreamSel::Dedicated(self.stream_id),
+                resp: resp_tx,
+            })
+            .map_err(|_| PublishError::NotConnected)
+    }
 }
