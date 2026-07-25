@@ -196,7 +196,7 @@ impl ClientBuilder {
                 client_identity: None,
                 reconnect: ReconnectPolicy::default(),
                 max_message_size: 1024 * 1024,
-                subscriber_buffer: 1024,
+                subscriber_buffer: 8192,
                 idle_timeout: Duration::from_secs(60),
             },
         }
