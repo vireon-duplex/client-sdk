@@ -127,6 +127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sz = frame_size();
     let dur = Duration::from_secs(duration_secs());
     let drain = Duration::from_secs(drain_secs());
+    // Per-run unique topic prefix so stale subscribers from prior runs
+    // (still alive on the server until idle-timeout reaps them) don't
+    // receive our publishes and inflate fan-out. Uses the PID + a
+    // coarse timestamp so two benches launched in the same second still
+    // collide with probability ~1/1000 — acceptable for a CLI bench.
+    let run_id = (std::process::id() as u64) ^ (nanos() >> 20);
+    let topic_prefix = format!("r{run_id:x}");
 
     print_header(
         "Scenario 13 — Aggregate Throughput (sustained ceiling)",
@@ -138,9 +145,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
     println!("  duration:     {:.1}s   (+ up to {}s drain)", dur.as_secs_f64(), drain.as_secs());
     println!("  total streams in flight: {}", n_pubs * n_streams);
+    println!("  topic prefix: {topic_prefix}.<pair>.<stream>");
     println!();
 
-    let result = run_config(&addr, n_pubs, n_streams, sz, dur, drain).await?;
+    let result = run_config(&addr, n_pubs, n_streams, sz, dur, drain, &topic_prefix).await?;
 
     // ── summary ─────────────────────────────────────────────────────
     println!();
@@ -217,6 +225,7 @@ async fn run_config(
     sz: usize,
     dur: Duration,
     drain: Duration,
+    topic_prefix: &str,
 ) -> Result<BenchResult, Box<dyn std::error::Error>> {
     // (topic, stream) tuples so each publisher task knows its topic.
     type StreamWithTopic = (String, vireon_sdk::StreamHandle);
@@ -227,9 +236,12 @@ async fn run_config(
     for p in 0..n_pubs {
         let c = connect_ready(addr).await;
         for s in 0..n_streams {
-            // Two-segment topic ("s{p}.s{s}") — required by default ACL
-            // `*.*`. Three-segment topics ("s13.0.0") are silently denied.
-            let topic = format!("s{p}.s{s}");
+            // Two-segment topic ("{prefix}.p{p}s{s}") — required by
+            // default ACL `*.*`. The per-run prefix isolates this run
+            // from stale subscribers left behind by prior bench runs
+            // (they linger on the server until idle-timeout reaps them
+            // and would otherwise amplify fan-out and corrupt metrics).
+            let topic = format!("{topic_prefix}.p{p}s{s}");
             let stream = c
                 .open_stream(
                     StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic),
@@ -250,7 +262,7 @@ async fn run_config(
     for p in 0..n_pubs {
         let c = connect_ready(addr).await;
         for s in 0..n_streams {
-            let topic = format!("s{p}.s{s}");
+            let topic = format!("{topic_prefix}.p{p}s{s}");
             let stream = c
                 .open_stream(
                     StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic),
@@ -408,6 +420,7 @@ async fn publisher_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0xA5u8; sz];
+    let mut consecutive_errs = 0u32;
     while !stop.load(Ordering::Relaxed) {
         // Stamp timestamp in first 8 bytes for latency measurement.
         let ts = nanos();
@@ -418,8 +431,20 @@ async fn publisher_loop(
             Ok(()) => {
                 bytes.fetch_add(sz as u64, Ordering::Relaxed);
                 frames.fetch_add(1, Ordering::Relaxed);
+                consecutive_errs = 0;
             }
             Err(_) => {
+                consecutive_errs = consecutive_errs.saturating_add(1);
+                // If we've been failing for a long time, the connection
+                // is dead — exit so the bench finishes instead of
+                // looping forever against a closed cmd channel.
+                if consecutive_errs > 2000 {
+                    eprintln!(
+                        "[s13] publisher for {topic} giving up after \
+                         {consecutive_errs} consecutive errors — connection lost"
+                    );
+                    return;
+                }
                 // Channel full — sleep briefly so the connection task gets
                 // a chance to drain the cmd channel. `yield_now` busy-loops
                 // and starves the connection task on the same worker.

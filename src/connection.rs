@@ -265,7 +265,17 @@ struct TaskState {
     /// drain completes so `Client::close()` returns only after all
     /// in-flight publishes have been flushed (or the drain timed out).
     close_resp: Option<oneshot::Sender<Result<(), ConnectError>>>,
+    /// Aggregate drop count for the default channel. Logged every
+    /// `DROP_LOG_INTERVAL`-th drop instead of per-message — the
+    /// per-drop WARN drowned server logs under sustained overload.
+    default_drops: u64,
+    /// Aggregate drop count for dedicated streams. Same rationale.
+    stream_drops: u64,
 }
+
+/// Log drop counters every Nth drop. Chosen so a brief overload
+/// typically yields 1 summary line, not thousands.
+const DROP_LOG_INTERVAL: u64 = 1024;
 
 /// One default-channel subscription, retained for reconnect replay.
 struct SubEntry {
@@ -292,6 +302,8 @@ impl TaskState {
             max_message_size,
             cmd_tx,
             close_resp: None,
+            default_drops: 0,
+            stream_drops: 0,
         }
     }
 
@@ -343,12 +355,16 @@ impl TaskState {
             for sub in &self.subs {
                 if pattern_matches(&sub.pattern, &topic_str) {
                     // try_send: never block the I/O task on a slow consumer.
-                    // A full channel drops the oldest-by-policy message; log it.
+                    // A full channel drops the oldest-by-policy message.
                     if let Err(mpsc::error::TrySendError::Full(_)) = sub.tx.try_send(msg.clone()) {
-                        tracing::warn!(
-                            pattern = %sub.pattern,
-                            "[client] subscriber channel full; dropping message (backpressure)"
-                        );
+                        self.default_drops = self.default_drops.wrapping_add(1);
+                        if self.default_drops % DROP_LOG_INTERVAL == 0 {
+                            tracing::warn!(
+                                pattern = %sub.pattern,
+                                total_drops = self.default_drops,
+                                "[client] subscriber channel full — dropped {DROP_LOG_INTERVAL} messages (backpressure)"
+                            );
+                        }
                     }
                 }
             }
@@ -356,10 +372,14 @@ impl TaskState {
             // Dedicated stream: deliver by stream id, no pattern matching.
             if let Some(entry) = self.streams.get(&sid) {
                 if let Err(mpsc::error::TrySendError::Full(_)) = entry.tx.try_send(msg) {
-                    tracing::warn!(
-                        stream_id = sid,
-                        "[client] dedicated-stream channel full; dropping message"
-                    );
+                    self.stream_drops = self.stream_drops.wrapping_add(1);
+                    if self.stream_drops % DROP_LOG_INTERVAL == 0 {
+                        tracing::warn!(
+                            stream_id = sid,
+                            total_drops = self.stream_drops,
+                            "[client] dedicated-stream channel full — dropped {DROP_LOG_INTERVAL} messages (backpressure)"
+                        );
+                    }
                 }
             }
         }
