@@ -301,6 +301,45 @@ impl Transport {
         Ok(())
     }
 
+    /// Drain pending partial writes with a timeout. Loops until all
+    /// buffered tails are flushed or `timeout` elapses. Returns `true`
+    /// if everything was drained, `false` on timeout.
+    ///
+    /// Called by the connection task during graceful shutdown to ensure
+    /// in-flight publishes aren't silently dropped when `close()` fires.
+    pub(crate) async fn drain_pending_gracefully(&mut self, timeout: Duration) -> bool {
+        if !self.has_pending() {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        while self.has_pending() && Instant::now() < deadline {
+            self.drain_recv();
+            self.flush_pending();
+            if let Err(e) = self.flush() {
+                tracing::warn!(error = %e, "[transport] drain flush error");
+                return false;
+            }
+            if self.has_pending() {
+                let next = self.next_event_deadline(Some(deadline));
+                self.wait_for_event(next).await;
+            }
+        }
+        !self.has_pending()
+    }
+
+    /// Returns `true` if any stream has buffered partial-write data awaiting
+    /// a flow-control window from the peer.
+    #[inline]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Total bytes buffered across all streams in [`Transport::pending`].
+    /// Used for diagnostic logging during graceful drain.
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending.values().map(BytesMut::len).sum()
+    }
+
     /// Retry pending partial writes before flushing. Called at the top of
     /// each connection-task iteration so buffered tails get drained as soon
     /// as the peer opens the flow-control window (MAX_STREAM_DATA).
