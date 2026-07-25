@@ -73,5 +73,9 @@ path = "examples/s11_ordering.rs"
 name = "s12_full_limit"
 path = "examples/s12_full_limit.rs"
 
+[[example]]
+name = "s13_aggregate_throughput"
+path = "examples/s13_aggregate_throughput.rs"
+
 [lints]
 workspace = true
