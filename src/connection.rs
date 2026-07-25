@@ -261,6 +261,10 @@ struct TaskState {
     max_message_size: usize,
     /// Back-reference to the command channel, embedded in `StreamHandle`s.
     cmd_tx: mpsc::Sender<ConnCmd>,
+    /// Pending response for a Close command — sent after the graceful
+    /// drain completes so `Client::close()` returns only after all
+    /// in-flight publishes have been flushed (or the drain timed out).
+    close_resp: Option<oneshot::Sender<Result<(), ConnectError>>>,
 }
 
 /// One default-channel subscription, retained for reconnect replay.
@@ -287,6 +291,7 @@ impl TaskState {
             seqs: HashMap::new(),
             max_message_size,
             cmd_tx,
+            close_resp: None,
         }
     }
 
@@ -386,8 +391,10 @@ impl TaskState {
                 false
             }
             ConnCmd::Close { resp } => {
-                transport.close();
-                let _ = resp.send(Ok(()));
+                // Store the response — the main loop sends it after the
+                // graceful drain completes. This ensures Client::close()
+                // returns only after all pending writes are flushed.
+                self.close_resp = Some(resp);
                 true
             }
         }
@@ -701,11 +708,35 @@ pub(crate) async fn run(
                             }
                         }
                         if exit {
+                            // Graceful drain: flush any partial-write tails
+                            // buffered in Transport::pending before sending
+                            // CONNECTION_CLOSE. Without this, frames buffered
+                            // by stream_send (awaiting a flow-control window
+                            // from the peer) would be silently dropped.
+                            const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+                            if !transport.drain_pending_gracefully(DRAIN_TIMEOUT).await {
+                                tracing::warn!(
+                                    pending_bytes = transport.pending_bytes(),
+                                    "[client] drain timed out — closing with unwritten data"
+                                );
+                            }
+                            transport.close();
+                            if let Some(resp) = state.close_resp.take() {
+                                let _ = resp.send(Ok(()));
+                            }
                             break;
                         }
                     }
                     None => {
-                        // All Client handles dropped — shut down gracefully.
+                        // All Client handles dropped — drain pending writes
+                        // before closing so in-flight publishes aren't lost.
+                        const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+                        if !transport.drain_pending_gracefully(DRAIN_TIMEOUT).await {
+                            tracing::warn!(
+                                pending_bytes = transport.pending_bytes(),
+                                "[client] drain timed out on drop — closing with unwritten data"
+                            );
+                        }
                         transport.close();
                         break;
                     }
