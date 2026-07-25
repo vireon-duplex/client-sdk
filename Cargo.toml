@@ -69,5 +69,9 @@ path = "examples/s10_mtls.rs"
 name = "s11_ordering"
 path = "examples/s11_ordering.rs"
 
+[[example]]
+name = "s12_full_limit"
+path = "examples/s12_full_limit.rs"
+
 [lints]
 workspace = true
