@@ -52,7 +52,7 @@ pub mod transport;
 // Re-exported here so users write `use vireon_sdk::{Client, ClientBuilder,
 // DeliveryPolicy, ...}` without descending into submodules.
 
-pub use config::{ClientBuilder, ReconnectPolicy, TlsVerify};
+pub use config::{ClientBuilder, ClientIdentity, ReconnectPolicy, TlsVerify};
 pub use connection::Client;
 pub use error::{ConnectError, DecodeError, PublishError, StreamError, SubscribeError};
 pub use message::{Message, Payload, Qos};

@@ -54,6 +54,41 @@ impl Default for TlsVerify {
     }
 }
 
+/// Client identity for mutual TLS (mTLS).
+///
+/// When set on a [`ClientBuilder`], the client presents this
+/// certificate chain + key during the TLS handshake so the server can
+/// authenticate the client. Independent of [`TlsVerify`] (which
+/// controls how the *client* validates the *server*): production
+/// mTLS deployments typically combine
+/// [`TlsVerify::Strict`] with a [`ClientIdentity`].
+///
+/// ```
+/// # use vireon_sdk::{ClientBuilder, ClientIdentity, TlsVerify};
+/// # fn demo() -> Result<(), vireon_sdk::ConnectError> {
+/// # async {
+/// let _ = ClientBuilder::new("127.0.0.1:4433")
+///     .sni("localhost")
+///     .tls_verify(TlsVerify::Strict { ca: "/etc/vireon/ca.pem".into() })
+///     .client_identity(ClientIdentity {
+///         cert: "/etc/vireon/client.pem".into(),
+///         key:  "/etc/vireon/client.key".into(),
+///     })
+///     .connect()
+///     .await?;
+/// # Ok::<_, vireon_sdk::ConnectError>(())
+/// # });
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ClientIdentity {
+    /// PEM-encoded certificate chain path.
+    pub cert: PathBuf,
+    /// PEM-encoded private key path.
+    pub key: PathBuf,
+}
+
 /// Reconnect behaviour after the connection drops.
 ///
 /// `max_attempts == 0` (the default) disables automatic reconnection: the
@@ -115,6 +150,10 @@ pub(crate) struct ClientConfig {
     pub sni: String,
     /// Certificate validation policy.
     pub tls: TlsVerify,
+    /// Optional client certificate for mutual TLS. When `Some`, the
+    /// client presents this cert + key during the TLS handshake so the
+    /// server can authenticate the client.
+    pub client_identity: Option<ClientIdentity>,
     /// Reconnect policy.
     pub reconnect: ReconnectPolicy,
     /// Maximum accepted payload size for a single message (defensive cap).
@@ -154,6 +193,7 @@ impl ClientBuilder {
                 port,
                 sni,
                 tls: TlsVerify::default(),
+                client_identity: None,
                 reconnect: ReconnectPolicy::default(),
                 max_message_size: 1024 * 1024,
                 subscriber_buffer: 1024,
@@ -173,6 +213,16 @@ impl ClientBuilder {
     #[must_use]
     pub fn tls_verify(mut self, v: TlsVerify) -> Self {
         self.cfg.tls = v;
+        self
+    }
+
+    /// Set the client identity for mutual TLS (default: none). When set,
+    /// the client presents this certificate during the handshake so the
+    /// server can authenticate it. Combine with [`TlsVerify::Strict`] for
+    /// production mTLS.
+    #[must_use]
+    pub fn client_identity(mut self, id: ClientIdentity) -> Self {
+        self.cfg.client_identity = Some(id);
         self
     }
 
