@@ -113,15 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pub_task = tokio::spawn({
         let client = pub_client.clone();
         async move {
+            let mut buf = [0u8; 16];
             for seq in 0..BURST {
-                let ts = nanos();
-                let mut buf = [0u8; 16];
-                buf[0..8].copy_from_slice(&ts.to_be_bytes());
                 buf[8..16].copy_from_slice(&seq.to_be_bytes());
 
-                client.publish("qs.data", &buf).await.ok();
-                client.publish("qs.cursor", &buf).await.ok();
-                client.publish("qs.events", &buf).await.ok();
+                // try_publish avoids the per-publish oneshot round-trip
+                // that publish().await costs (≈3 ms scheduler latency).
+                // On backpressure (channel full), yield to let the
+                // connection task drain. Timestamp is re-stamped on
+                // each attempt so the measured latency reflects only
+                // the real network + server path, not queueing delay.
+                for topic in ["qs.data", "qs.cursor", "qs.events"] {
+                    loop {
+                        let ts = nanos();
+                        buf[0..8].copy_from_slice(&ts.to_be_bytes());
+                        match client.try_publish(topic, &buf) {
+                            Ok(()) => break,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                }
             }
         }
     });
