@@ -160,6 +160,11 @@ pub(crate) struct ClientConfig {
     pub max_message_size: usize,
     /// Depth of each subscriber's bounded channel.
     pub subscriber_buffer: usize,
+    /// Depth of the command channel between [`Client`] handles and the
+    /// background I/O task. Larger values absorb `try_publish` bursts;
+    /// smaller values apply backpressure sooner. Each entry is ~80 B +
+    /// payload, so 4096 ≈ 330 KiB + payload bytes per connection.
+    pub cmd_channel_cap: usize,
     /// QUIC idle timeout. The effective connection idle timeout is
     /// `min(client, server)`. Lower values detect dead peers faster at the
     /// cost of tearing down quiet connections sooner.
@@ -197,6 +202,7 @@ impl ClientBuilder {
                 reconnect: ReconnectPolicy::default(),
                 max_message_size: 1024 * 1024,
                 subscriber_buffer: 8192,
+                cmd_channel_cap: 1024,
                 idle_timeout: Duration::from_secs(60),
             },
         }
@@ -248,6 +254,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Depth of the command channel between [`Client`] handles and the
+    /// background I/O task (default 4096). `try_publish` returns
+    /// [`PublishError::NotConnected`](crate::PublishError::NotConnected)
+    /// when full; `publish().await` yields (natural backpressure).
+    /// Raise for bursty high-throughput workloads; lower to apply
+    /// backpressure sooner.
+    #[must_use]
+    pub fn cmd_channel_cap(mut self, n: usize) -> Self {
+        self.cfg.cmd_channel_cap = n;
+        self
+    }
+
     /// QUIC idle timeout. The effective connection idle timeout is negotiated
     /// as `min(client, server)`. Lowering this makes dead-peer detection
     /// faster at the cost of closing quiet connections sooner; the SDK's
@@ -271,7 +289,8 @@ impl ClientBuilder {
     /// See [`ConnectError`].
     pub async fn connect(self) -> Result<Client, ConnectError> {
         let cfg = self.cfg;
-        let (tx, rx) = tokio::sync::mpsc::channel(crate::connection::CMD_CHANNEL_CAP);
+        let cap = cfg.cmd_channel_cap.max(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         // Clone the sender into the task so it can embed it in StreamHandles.
         // The spawned task is detached: it exits when the last Client handle
