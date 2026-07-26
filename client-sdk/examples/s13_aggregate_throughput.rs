@@ -117,10 +117,41 @@ fn drain_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// Pick the tokio worker thread count.
+///
+/// Auto-tunes to `available_parallelism / 2`, clamped to `[2, 6]` — leaves
+/// room for the server process (which has its own per-core worker threads)
+/// and avoids the client-side oversubscription that hurts throughput once
+/// total task count exceeds physical cores.
+///
+/// Override with `S13_WORKERS=N` to experiment with different counts.
+fn worker_threads() -> usize {
+    if let Some(n) = std::env::var("S13_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return n;
+    }
+    let phys = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    (phys / 2).clamp(2, 6)
+}
+
 // ── entry point ─────────────────────────────────────────────────────
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let workers = worker_threads();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            run().await
+        })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let (addr, _server) = resolve_server().await;
 
@@ -144,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  pairs:        {n_pubs}   (each pair = 1 pub conn + 1 sub conn)");
     println!("  streams/pair: {n_streams}   (parallel QUIC streams per pair)");
+    println!("  tokio workers: {}   (override: S13_WORKERS=N)", worker_threads());
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
     println!("  duration:     {:.1}s   (+ up to {}s drain)", dur.as_secs_f64(), drain.as_secs());
     println!("  total streams in flight: {}", n_pubs * n_streams);

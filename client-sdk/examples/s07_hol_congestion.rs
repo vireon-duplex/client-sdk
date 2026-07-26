@@ -117,8 +117,31 @@ const DURATION: Duration = Duration::from_secs(10);
 /// for this long so any frames still in flight land in the histogram.
 const DRAIN: Duration = Duration::from_secs(2);
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Pick the tokio worker thread count — auto-tunes to
+/// `available_parallelism / 2` clamped to `[2, 6]`, leaving room for the
+/// server's per-core worker threads. Override with `S07_WORKERS=N`.
+fn worker_threads() -> usize {
+    if let Some(n) = std::env::var("S07_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return n;
+    }
+    let phys = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    (phys / 2).clamp(2, 6)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .enable_all()
+        .build()?
+        .block_on(async move { run().await })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let (addr, _server) = resolve_server().await;
 
