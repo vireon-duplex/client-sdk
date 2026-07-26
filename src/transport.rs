@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -55,6 +57,13 @@ pub(crate) struct Transport {
     /// silently drop the tail and corrupt the byte stream — causing
     /// CrcMismatch + decoder desync on the server side.
     pending: HashMap<u64, BytesMut>,
+    /// Shared atomic mirror of total `pending` bytes. Updated on every
+    /// stream_send / flush_pending so publishers can check backpressure
+    /// via [`Client::pending_bytes`] without entering the connection task.
+    /// Unlike the cmd-channel-full signal (which fires only after CAP
+    /// commands queue up), this reflects real-time QUIC flow-control
+    /// pressure from the subscriber side.
+    pending_shared: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Transport {
@@ -87,6 +96,7 @@ impl Transport {
             recv_buf: vec![0u8; DGRAM_BUF],
             decoders: HashMap::new(),
             pending: HashMap::new(),
+            pending_shared: Arc::new(AtomicUsize::new(0)),
         };
 
         t.handshake().await?;
@@ -278,10 +288,12 @@ impl Transport {
                 }
                 Err(quiche::Error::FinalSize) => {
                     self.pending.remove(&stream_id);
+                    self.sync_pending_shared();
                     return Err(ConnectError::Closed("stream already closed".into()));
                 }
                 Err(e) => {
                     self.pending.remove(&stream_id);
+                    self.sync_pending_shared();
                     return Err(ConnectError::Quiche(e));
                 }
             }
@@ -297,6 +309,7 @@ impl Transport {
             // Everything written; clear any stale pending entry.
             self.pending.remove(&stream_id);
         }
+        self.sync_pending_shared();
 
         Ok(())
     }
@@ -338,6 +351,28 @@ impl Transport {
     /// Used for diagnostic logging during graceful drain.
     pub(crate) fn pending_bytes(&self) -> usize {
         self.pending.values().map(BytesMut::len).sum()
+    }
+
+    /// Returns a clone of the shared atomic for [`Client::pending_bytes`].
+    /// The connection task updates this on every stream_send / flush_pending;
+    /// publishers read it to detect QUIC flow-control backpressure before
+    /// the cmd channel fills.
+    pub(crate) fn pending_shared(&self) -> Arc<AtomicUsize> {
+        self.pending_shared.clone()
+    }
+
+    /// Replace the internal pending-shared mirror with the one shared
+    /// with the Client. Called once by the connection task after
+    /// [`Transport::connect`] so the Client sees live updates.
+    pub(crate) fn set_pending_shared(&mut self, shared: Arc<AtomicUsize>) {
+        self.pending_shared = shared;
+        self.sync_pending_shared();
+    }
+
+    /// Sync the shared atomic to match the actual pending total. Called
+    /// after every mutation of `pending` so publishers see a current value.
+    fn sync_pending_shared(&self) {
+        self.pending_shared.store(self.pending_bytes(), Ordering::Relaxed);
     }
 
     /// Retry pending partial writes before flushing. Called at the top of
