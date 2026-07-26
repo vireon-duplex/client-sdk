@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use vireon_sdk::{ClientBuilder, TlsVerify};
+use vireon_sdk::{ClientBuilder, ReconnectPolicy, TlsVerify};
 
 // ── test cert generation ────────────────────────────────────────────
 
@@ -125,6 +125,28 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
+            // Send SIGINT first so the server runs its graceful shutdown
+            // path (drain connections → Reactor::drop → AsyncCancel2
+            // cancels the multishot RECV → fds close cleanly). Without
+            // this, SIGKILL bypasses all cleanup and leaves ghost UDP
+            // sockets that cause handshake timeouts on the next run.
+            let pid = c.id() as i32;
+            // SAFETY: kill(2) on a child PID we own; signal number is
+            // validated by the libc constants.
+            unsafe { libc::kill(pid, libc::SIGINT); }
+
+            // Poll for graceful exit (up to 3s).
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                match c.try_wait() {
+                    Ok(Some(_)) => return, // exited cleanly
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    _ => break, // timed out or error → fall through to kill
+                }
+            }
+            // Force kill as last resort.
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -155,26 +177,78 @@ pub async fn resolve_server() -> (String, Option<ServerGuard>) {
     let (cert, key) = write_dev_cert().expect("cert");
     let port = ephemeral_port().expect("port");
     let guard = ServerGuard::start(port, &cert, &key).expect("server");
-    // Brief delay so the server binds before we connect.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Give the server a moment to bind before we start connecting.
+    // 1s covers the io_uring + buffer-pool init path even under load.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     (format!("127.0.0.1:{port}"), Some(guard))
 }
 
 /// Retry-connect with `DangerAcceptInvalid` TLS until the server answers
 /// (server takes a moment to start). SNI is fixed to `localhost`.
+///
+/// Each attempt is capped at 2 s so a server that hasn't bound yet
+/// doesn't eat the full 10 s handshake timeout — retries happen fast.
 pub async fn connect_ready(addr: &str) -> vireon_sdk::Client {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match ClientBuilder::new(addr)
-            .sni("localhost")
-            .tls_verify(TlsVerify::DangerAcceptInvalid)
-            .connect()
-            .await
-        {
-            Ok(c) => return c,
-            Err(e) => {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(2),
+            ClientBuilder::new(addr)
+                .sni("localhost")
+                .tls_verify(TlsVerify::DangerAcceptInvalid)
+                .connect(),
+        )
+        .await;
+
+        match attempt {
+            Ok(Ok(c)) => return c,
+            Ok(Err(e)) => {
                 if tokio::time::Instant::now() >= deadline {
                     panic!("could not connect to test server: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(_) => {
+                // Per-attempt timeout — server not ready yet.
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("could not connect to test server: connect_ready deadline exceeded");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+/// Same retry-loop as [`connect_ready`], but configures a [`ReconnectPolicy`]
+/// on the client. Used by scenarios that need auto-reconnect + resubscribe
+/// semantics on the subscriber (e.g. s09_reconnect).
+pub async fn connect_ready_with_reconnect(
+    addr: &str,
+    policy: ReconnectPolicy,
+) -> vireon_sdk::Client {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(2),
+            ClientBuilder::new(addr)
+                .sni("localhost")
+                .tls_verify(TlsVerify::DangerAcceptInvalid)
+                .reconnect(policy.clone())
+                .connect(),
+        )
+        .await;
+
+        match attempt {
+            Ok(Ok(c)) => return c,
+            Ok(Err(e)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("could not connect to test server: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("could not connect to test server: connect_ready_with_reconnect deadline exceeded");
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
