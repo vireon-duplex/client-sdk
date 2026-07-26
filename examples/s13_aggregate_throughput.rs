@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
     println!("  duration:     {:.1}s   (+ up to {}s drain)", dur.as_secs_f64(), drain.as_secs());
     println!("  total streams in flight: {}", n_pubs * n_streams);
-    println!("  topic prefix: {topic_prefix}.p<N>s<M>");
+    println!("  topic prefix: {topic_prefix}   (e.g. {topic_prefix}.p0s0, {topic_prefix}.p1s3)");
     println!();
 
     let result = run_config(&addr, n_pubs, n_streams, sz, dur, drain, &topic_prefix).await?;
