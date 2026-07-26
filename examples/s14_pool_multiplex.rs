@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bench_common::{connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server, Histogram};
-use vireon_sdk::{ClientBuilder, ClientPool};
+use vireon_sdk::ClientPool;
 
 fn pool_size() -> usize {
     std::env::var("S14_POOL")
@@ -115,11 +115,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // ── publisher pool ───────────────────────────────────────────────
-    let pool = ClientPool::connect(
-        ClientBuilder::new(&addr).cmd_channel_cap(2048),
-        pool_n,
-    )
-    .await?;
+    // Connect members sequentially via connect_ready (robust 2 s per-attempt
+    // retry loop) rather than ClientPool::connect's concurrent spawn. This
+    // avoids handshake contention under startup load — each member gets the
+    // server's undivided attention for its handshake.
+    let mut members = Vec::with_capacity(pool_n);
+    for _ in 0..pool_n {
+        members.push(connect_ready(&addr).await);
+    }
+    let pool = ClientPool::from_clients(members);
 
     let payload = vec![0u8; sz];
     let sent = Arc::new(AtomicU64::new(0));

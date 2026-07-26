@@ -47,10 +47,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, ephemeral_port, init_tracing, print_footer, print_header, write_dev_cert,
-    ServerGuard,
+    connect_ready, connect_ready_with_reconnect, ephemeral_port, init_tracing, print_footer,
+    print_header, write_dev_cert, ServerGuard,
 };
-use vireon_sdk::{ClientBuilder, DeliveryPolicy, ReconnectPolicy, StreamSpec, TlsVerify};
+use vireon_sdk::{DeliveryPolicy, ReconnectPolicy, StreamSpec};
 
 /// How long to publish in each phase (before and after reconnect).
 const PHASE_DURATION: Duration = Duration::from_secs(3);
@@ -79,18 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // ── connect subscriber with reconnect enabled ───────────────────
-    let sub = ClientBuilder::new(&addr1)
-        .sni("localhost")
-        .tls_verify(TlsVerify::DangerAcceptInvalid)
-        .reconnect(ReconnectPolicy {
+    let sub = connect_ready_with_reconnect(
+        &addr1,
+        ReconnectPolicy {
             max_attempts: 10,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(5),
             resubscribe: true,
-        })
-        .connect()
-        .await
-        .expect("connect");
+        },
+    )
+    .await;
 
     // ── open a dedicated ReliableOrdered stream ──────────────────────
     let stream = sub
@@ -140,37 +138,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _server2 = ServerGuard::start(port2, &cert, &key).expect("server (restart)");
 
     // ── wait for server2 to accept connections ──────────────────────
-    let restarted_at = tokio::time::timeout(RESTART_TIMEOUT, async {
-        loop {
-            match ClientBuilder::new(&addr2)
-                .sni("localhost")
-                .tls_verify(TlsVerify::DangerAcceptInvalid)
-                .connect()
-                .await
-            {
-                Ok(probe) => {
-                    probe.close().await.ok();
-                    return;
-                }
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            }
-        }
-    })
-    .await;
-
-    match restarted_at {
-        Ok(()) => {
-            let latency = kill_time.elapsed();
-            println!("  server back up after {:.1} s on {addr2}", latency.as_secs_f64());
-        }
+    // connect_ready already retries with per-attempt timeout + 30 s deadline.
+    let restart_start = Instant::now();
+    let probe = match tokio::time::timeout(RESTART_TIMEOUT, connect_ready(&addr2)).await {
+        Ok(c) => c,
         Err(_) => {
             println!("  \u{2717} server2 did not come back within {RESTART_TIMEOUT:?}");
             print_footer();
             return Ok(());
         }
-    }
+    };
+    probe.close().await.ok();
+    println!(
+        "  server back up after {:.1} s on {addr2}",
+        restart_start.elapsed().as_secs_f64()
+    );
 
     // ── drop old subscriber + collector (reconnect FSM targets addr1) ──
     // The old subscriber's ReconnectPolicy keeps retrying addr1, which is
@@ -180,18 +162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sub.close().await.ok();
 
     // ── create NEW subscriber against server2 (resubscribe replay) ──
-    let sub2 = ClientBuilder::new(&addr2)
-        .sni("localhost")
-        .tls_verify(TlsVerify::DangerAcceptInvalid)
-        .reconnect(ReconnectPolicy {
+    let sub2 = connect_ready_with_reconnect(
+        &addr2,
+        ReconnectPolicy {
             max_attempts: 10,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(5),
             resubscribe: true,
-        })
-        .connect()
-        .await
-        .expect("reconnect");
+        },
+    )
+    .await;
 
     let stream2 = sub2
         .open_stream(
