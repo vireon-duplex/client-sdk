@@ -18,6 +18,8 @@
 //!   no pattern matching, which is what gives them head-of-line isolation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -98,13 +100,35 @@ pub(crate) enum ConnCmd {
 #[derive(Clone)]
 pub struct Client {
     tx: mpsc::Sender<ConnCmd>,
+    /// Mirror of the transport's pending-bytes counter. Updated by the
+    /// connection task on every `stream_send` / `flush_pending`; read by
+    /// publishers via [`Self::pending_bytes`] to detect QUIC flow-control
+    /// backpressure from the subscriber before the cmd channel fills.
+    pending_shared: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Client {
     /// Construct the public handle. Called by [`crate::ClientBuilder::connect`].
     #[must_use]
-    pub(crate) fn new(tx: mpsc::Sender<ConnCmd>) -> Self {
-        Self { tx }
+    pub(crate) fn new(
+        tx: mpsc::Sender<ConnCmd>,
+        pending_shared: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self { tx, pending_shared }
+    }
+
+    /// Total bytes buffered in `Transport::pending` awaiting a QUIC
+    /// flow-control window from the peer. Non-zero means the subscriber
+    /// is falling behind and the server has stopped accepting new data
+    /// on the affected streams.
+    ///
+    /// Publishers can check this before `try_publish` to apply
+    /// early backpressure — yielding briefly when the value is high
+    /// keeps the in-flight gap small enough that `close()` can drain
+    /// within its timeout.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_shared.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Subscribe to a topic pattern on the default channel.
@@ -258,6 +282,9 @@ struct TaskState {
     max_message_size: usize,
     /// Back-reference to the command channel, embedded in `StreamHandle`s.
     cmd_tx: mpsc::Sender<ConnCmd>,
+    /// Mirror of the transport's pending-bytes counter, embedded in
+    /// `StreamHandle`s so publishers can observe flow-control backpressure.
+    pending_shared: Arc<AtomicUsize>,
     /// Pending response for a Close command — sent after the graceful
     /// drain completes so `Client::close()` returns only after all
     /// in-flight publishes have been flushed (or the drain timed out).
@@ -289,7 +316,12 @@ struct StreamEntry {
 }
 
 impl TaskState {
-    fn new(subscriber_buffer: usize, max_message_size: usize, cmd_tx: mpsc::Sender<ConnCmd>) -> Self {
+    fn new(
+        subscriber_buffer: usize,
+        max_message_size: usize,
+        cmd_tx: mpsc::Sender<ConnCmd>,
+        pending_shared: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             subs: Vec::new(),
             streams: HashMap::new(),
@@ -298,6 +330,7 @@ impl TaskState {
             seqs: HashMap::new(),
             max_message_size,
             cmd_tx,
+            pending_shared,
             close_resp: None,
             default_drops: 0,
             stream_drops: 0,
@@ -502,7 +535,7 @@ impl TaskState {
 
         transport.flush().map_err(|_| StreamError::NotConnected)?;
 
-        Ok(StreamHandle::new(sid, rx, self.cmd_tx.clone()))
+        Ok(StreamHandle::new(sid, rx, self.cmd_tx.clone(), self.pending_shared.clone()))
     }
 
     /// Re-send every active subscription and re-open every dedicated stream
@@ -604,10 +637,14 @@ pub(crate) async fn run(
     cfg: ClientConfig,
     mut rx: mpsc::Receiver<ConnCmd>,
     cmd_tx: mpsc::Sender<ConnCmd>,
+    pending_shared: Arc<AtomicUsize>,
     ready: oneshot::Sender<Result<(), ConnectError>>,
 ) {
     let mut transport = match Transport::connect(&cfg).await {
-        Ok(t) => {
+        Ok(mut t) => {
+            // Wire the shared pending-bytes mirror into the transport
+            // so publishers can observe flow-control backpressure.
+            t.set_pending_shared(pending_shared.clone());
             // Connection is up; unblock ClientBuilder::connect.
             let _ = ready.send(Ok(()));
             t
@@ -618,7 +655,7 @@ pub(crate) async fn run(
         }
     };
 
-    let mut state = TaskState::new(cfg.subscriber_buffer, cfg.max_message_size, cmd_tx);
+    let mut state = TaskState::new(cfg.subscriber_buffer, cfg.max_message_size, cmd_tx, pending_shared.clone());
 
     // Dead-peer detection: quiche 0.22 has no built-in keepalive and ICMP
     // port-unreachable is not reliably surfaced on loopback. So we use a
