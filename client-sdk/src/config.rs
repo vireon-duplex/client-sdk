@@ -174,10 +174,13 @@ pub(crate) struct ClientConfig {
 /// Builder for a [`Client`].
 ///
 /// Construct with [`ClientBuilder::new`], chain setters, then [`connect`].
+/// Cloning the builder (e.g. for [`ClientPool::connect`](crate::ClientPool::connect))
+/// produces an identical builder — the wrapped [`ClientConfig`] is already
+/// `Clone`.
 ///
 /// [`connect`]: ClientBuilder::connect
 /// [`Client`]: crate::Client
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ClientBuilder {
     cfg: ClientConfig,
 }
