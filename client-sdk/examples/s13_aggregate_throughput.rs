@@ -322,8 +322,8 @@ async fn run_config(
         let bs = bytes_sent.clone();
         let fs = frames_sent.clone();
         let stop = stop.clone();
-        let fr = frames_recv.clone();
-        pub_tasks.push(tokio::spawn(publisher_loop(stream, topic, sz, bs, fs, stop, fr)));
+        let br = bytes_recv.clone();
+        pub_tasks.push(tokio::spawn(publisher_loop(stream, topic, sz, bs, fs, stop, br)));
     }
 
     // ── run for `dur`, then stop publishers ─────────────────────────
@@ -433,26 +433,36 @@ async fn publisher_loop(
     bytes: Arc<AtomicU64>,
     frames: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    frames_recv: Arc<AtomicU64>,
+    bytes_recv: Arc<AtomicU64>,
 ) {
-    // When the in-flight gap (frames_sent − frames_recv across all
-    // subscribers) exceeds this, slow down. Sized so that with the
-    // default 8 KiB frame and 2×1 config the publisher yields ~10 ms
-    // at most before the subscriber catches up — enough to keep the
-    // server's retry queue in its sweet spot without capping throughput
-    // under healthy load.
-    const BACKPRESSURE_THRESHOLD: u64 = 4096;
+    // Byte-based backpressure cap. The frame-count gap that the previous
+    // constant (4096 frames) represented was safe at 8 KiB (32 MiB) but
+    // allowed 256 MiB in-flight at 64 KiB frames — far more than the
+    // subscriber's flow-control window could absorb before close() fired.
+    // Capping the IN-FLIGHT BYTES keeps the gap proportional to the
+    // subscriber's drain rate regardless of frame size.
+    //
+    // 32 MiB is chosen so:
+    //   * 8 KiB frames: ~4096 frames in flight (same as before)
+    //   * 32 KiB frames: ~1024 frames in flight
+    //   * 64 KiB frames: ~512 frames in flight
+    // Across 16 streams that's 2 MiB/stream — well within the 10 MiB
+    // per-stream flow-control window, leaving headroom for close() to
+    // drain within its 10 s timeout.
+    const BACKPRESSURE_BYTE_CAP: u64 = 32 * 1024 * 1024;
     let mut buf = vec![0xA5u8; sz];
     let mut consecutive_errs = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        // ── backpressure check ────────────────────────────────────
-        // If subscribers are falling behind, yield briefly instead of
-        // piling more data into the server's retry queue. This is the
-        // application-level equivalent of QUIC flow control — without
-        // it, the server's retry queue overflows and drops frames.
-        let sent = frames.load(Ordering::Relaxed);
-        let recv = frames_recv.load(Ordering::Relaxed);
-        if sent > recv && sent - recv > BACKPRESSURE_THRESHOLD {
+        // ── backpressure check (byte-based) ───────────────────────
+        // Two signals:
+        // 1. frames_sent − frames_recv gap (catches subscriber-side slowness)
+        // 2. transport pending bytes (catches server-side flow-control blocks)
+        // If EITHER signal exceeds its threshold, yield briefly.
+        let sent_bytes = bytes.load(Ordering::Relaxed);
+        let recv_bytes = bytes_recv.load(Ordering::Relaxed);
+        let gap_bytes = sent_bytes.saturating_sub(recv_bytes);
+        let pending = stream.pending_bytes() as u64;
+        if gap_bytes > BACKPRESSURE_BYTE_CAP || pending > BACKPRESSURE_BYTE_CAP {
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
