@@ -205,6 +205,52 @@ impl Client {
         resp_rx.await.map_err(|_| PublishError::NotConnected)?
     }
 
+    /// Publish with bounded auto-retry on transient errors.
+    ///
+    /// Retries [`PublishError::NotConnected`] up to `max_attempts` times
+    /// with exponential backoff (`initial_backoff * 2^attempt`, capped at
+    /// `max_backoff`). Useful when the connection is mid-reconnect: the
+    /// application can fire-and-forget instead of wiring its own retry
+    /// loop. Non-transient errors (`TooLarge`, `EncodingFailed`) short-
+    /// circuit on the first attempt.
+    ///
+    /// Total elapsed time is bounded by `max_attempts * max_backoff`.
+    /// Set `max_attempts = 0` for "try once, no retry" (equivalent to
+    /// [`Client::publish`]).
+    ///
+    /// # Errors
+    /// The last [`PublishError`] encountered. `NotConnected` if every
+    /// attempt failed during a reconnect window.
+    pub async fn publish_with_retries(
+        &self,
+        topic: &str,
+        payload: impl crate::message::Payload,
+        max_attempts: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Result<(), PublishError> {
+        // Encode once; reuse the Bytes on every attempt (cheap clone).
+        let payload: Bytes = payload.into_bytes();
+        let mut last_err = PublishError::NotConnected;
+        for attempt in 0..=max_attempts {
+            match self.publish(topic, payload.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(PublishError::NotConnected) => {
+                    last_err = PublishError::NotConnected;
+                    if attempt == max_attempts {
+                        break;
+                    }
+                    let backoff = backoff_for(attempt, initial_backoff, max_backoff);
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                // Non-transient — surface immediately.
+                Err(other) => return Err(other),
+            }
+        }
+        Err(last_err)
+    }
+
     /// Fire-and-forget publish — enqueues the frame without waiting for the
     /// connection task to confirm.  This avoids the per-publish oneshot
     /// round-trip (which costs ~2 ms of scheduler latency) and is the right
@@ -262,6 +308,20 @@ impl Client {
             .await
             .map_err(|_| ConnectError::Closed("connection task exited".into()))?
     }
+}
+
+/// Exponential backoff for the `attempt`-th retry (0-indexed):
+/// `initial * 2^attempt`, clamped to `max`.
+///
+/// Mirrors [`ReconnectPolicy::backoff_for`](crate::config::ReconnectPolicy::backoff_for)
+/// but as a free function so [`Client::publish_with_retries`] can compute a
+/// schedule without constructing a full `ReconnectPolicy`.
+fn backoff_for(attempt: u32, initial: Duration, max: Duration) -> Duration {
+    let shift = attempt.min(31);
+    let initial_ms = initial.as_millis() as u64;
+    let base = initial_ms.saturating_mul(1u64 << shift);
+    let max_ms = max.as_millis().max(1) as u64;
+    Duration::from_millis(base.min(max_ms))
 }
 
 // ── the background task ─────────────────────────────────────────────
@@ -988,5 +1048,46 @@ mod tests {
     fn publish_encode_layout() {
         let b = encode_publish("t", &[1, 2, 3]);
         assert_eq!(b, &[0, 1, b't', 1, 2, 3]);
+    }
+
+    #[test]
+    fn backoff_for_zero_returns_initial() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(10);
+        // attempt 0: initial * 2^0 = initial
+        assert_eq!(backoff_for(0, initial, max), initial);
+    }
+
+    #[test]
+    fn backoff_for_grows_exponentially() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(60);
+        // attempt 3: 100ms * 2^3 = 800ms
+        assert_eq!(backoff_for(3, initial, max), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn backoff_for_clamps_at_max() {
+        let initial = Duration::from_millis(500);
+        let max = Duration::from_secs(1);
+        // attempt 20 would be ~5242880000 ms but clamps to 1s
+        assert_eq!(backoff_for(20, initial, max), max);
+    }
+
+    #[test]
+    fn backoff_for_handles_max_zero_gracefully() {
+        // max_ms floored to 1ms to avoid Duration::from_millis(0) edge cases.
+        let initial = Duration::from_millis(10);
+        let max = Duration::from_millis(0);
+        assert_eq!(backoff_for(5, initial, max), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn backoff_for_does_not_panic_on_large_attempt() {
+        // attempt saturates at 31 shifts; should never panic.
+        let initial = Duration::from_millis(1);
+        let max = Duration::from_secs(60);
+        let _ = backoff_for(u32::MAX, initial, max);
+        let _ = backoff_for(31, initial, max);
     }
 }
