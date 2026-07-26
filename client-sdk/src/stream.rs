@@ -12,6 +12,8 @@
 //! head-of-line blocking isolation between streams. Congestion or retransmission
 //! on one dedicated stream never blocks another.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
@@ -65,6 +67,9 @@ pub struct StreamHandle {
     rx: mpsc::Receiver<Message>,
     /// Back-channel to the connection task (for `publish`).
     cmd_tx: mpsc::Sender<ConnCmd>,
+    /// Mirror of the transport's pending-bytes counter (shared with the
+    /// connection task). Read by [`Self::pending_bytes`] for backpressure.
+    pending_shared: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StreamHandle {
@@ -74,11 +79,13 @@ impl StreamHandle {
         stream_id: u64,
         rx: mpsc::Receiver<Message>,
         cmd_tx: mpsc::Sender<ConnCmd>,
+        pending_shared: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
             stream_id,
             rx,
             cmd_tx,
+            pending_shared,
         }
     }
 
@@ -87,6 +94,20 @@ impl StreamHandle {
     #[must_use]
     pub fn stream_id(&self) -> u64 {
         self.stream_id
+    }
+
+    /// Total bytes buffered in `Transport::pending` across ALL streams
+    /// on this client's connection (not just this stream). Non-zero
+    /// means the subscriber is falling behind and the server has
+    /// stopped accepting new data on some streams.
+    ///
+    /// Publishers can check this before `try_publish` to apply early
+    /// backpressure — yielding briefly when the value is high keeps the
+    /// in-flight gap small enough that `close()` can drain within its
+    /// timeout.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_shared.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Await the next message delivered on this stream, or `None` when the
