@@ -55,7 +55,7 @@ pub mod transport;
 
 pub use config::{ClientBuilder, ClientIdentity, ReconnectPolicy, TlsVerify};
 pub use connection::Client;
-pub use error::{ConnectError, DecodeError, PublishError, StreamError, SubscribeError};
+pub use error::{ConnectError, DecodeError, PublishError, RpcError, StreamError, SubscribeError};
 pub use message::{Message, Payload, Qos};
 pub use pool::ClientPool;
 pub use pubsub::Subscription;
