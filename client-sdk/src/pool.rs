@@ -105,6 +105,29 @@ impl ClientPool {
         })
     }
 
+    /// Build a pool from already-connected clients.
+    ///
+    /// Useful when the caller wants to control the connection strategy
+    /// (e.g. sequential connects with custom retry logic) rather than
+    /// relying on the concurrent connect-all-at-once path in
+    /// [`connect`](Self::connect).
+    ///
+    /// # Panics
+    /// Panics if `members` is empty.
+    #[must_use]
+    pub fn from_clients(members: Vec<Client>) -> Self {
+        assert!(
+            !members.is_empty(),
+            "ClientPool::from_clients requires at least one member"
+        );
+        Self {
+            inner: Arc::new(PoolInner {
+                members,
+                next: AtomicUsize::new(0),
+            }),
+        }
+    }
+
     /// Number of pool members.
     #[must_use]
     pub fn len(&self) -> usize {
