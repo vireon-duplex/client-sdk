@@ -77,5 +77,9 @@ path = "examples/s12_full_limit.rs"
 name = "s13_aggregate_throughput"
 path = "examples/s13_aggregate_throughput.rs"
 
+[[example]]
+name = "s14_pool_multiplex"
+path = "examples/s14_pool_multiplex.rs"
+
 [lints]
 workspace = true
