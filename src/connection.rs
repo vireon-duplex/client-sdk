@@ -17,9 +17,9 @@
 //! * dedicated streams ([`StreamHandle`]) receive frames purely by stream id —
 //!   no pattern matching, which is what gives them head-of-line isolation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -29,7 +29,7 @@ use send_policy::StreamOpenMeta;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::ClientConfig;
-use crate::error::{ConnectError, PublishError, StreamError, SubscribeError};
+use crate::error::{ConnectError, PublishError, RpcError, StreamError, SubscribeError};
 use crate::message::Message;
 use crate::pubsub::Subscription;
 use crate::stream::{StreamHandle, StreamSpec};
@@ -41,6 +41,22 @@ use crate::DeliveryPolicy;
 /// drain loop, starving other tasks (notably the subscriber's connection
 /// task on the same tokio worker).
 const MAX_CMD_BATCH: usize = 64;
+
+/// Monotonic correlation-id source for `Client::rpc`. Starts at 1 so 0 is
+/// reserved as "no cid assigned" (defensive — never appears on the wire
+/// because the counter is incremented before use).
+static RPC_CID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate the next 128-bit RPC correlation id.
+///
+/// Embeds the AtomicU64 counter in the low 64 bits; the high 64 bits are
+/// zero (reserved for a future per-connection epoch to harden against
+/// cross-reconnect collisions). u64 overflow at ~1.8×10¹⁹ calls per
+/// process is not a concern in practice.
+fn next_rpc_cid() -> u128 {
+    let n = RPC_CID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    n as u128
+}
 
 /// QUIC stream id used for the shared default pub/sub channel. The first
 /// client-initiated bidirectional stream is 0; dedicated streams start at
@@ -87,6 +103,23 @@ pub(crate) enum ConnCmd {
         spec: StreamSpec,
         resp: oneshot::Sender<Result<StreamHandle, StreamError>>,
     },
+    /// Register a pending RPC reply handler.
+    ///
+    /// The connection task (1) lazily subscribes to `reply_topic` if not
+    /// already subscribed, (2) stores `cid → resp` in `pending_rpcs` so
+    /// that the next inbound publish on the reply topic whose payload
+    /// starts with `cid` (16-byte BE u128) is routed to this oneshot
+    /// with the cid prefix stripped.
+    RegisterRpcReply {
+        cid: u128,
+        reply_topic: String,
+        resp: oneshot::Sender<Message>,
+    },
+    /// Cancel a pending RPC reply handler (drop without delivering).
+    ///
+    /// Sent by `Client::rpc` when the caller's timeout elapses or the
+    /// receiver is dropped. Removes the entry from `pending_rpcs`.
+    CancelRpc { cid: u128 },
     /// Close the connection.
     Close {
         resp: oneshot::Sender<Result<(), ConnectError>>,
@@ -251,6 +284,79 @@ impl Client {
         Err(last_err)
     }
 
+    /// Request/reply RPC over the default pub/sub channel.
+    ///
+    /// Publishes `payload` to `request_topic` and awaits the first reply
+    /// published to `reply_topic` with a matching correlation id, returning
+    /// it as a [`Message`] whose payload has the cid prefix stripped.
+    ///
+    /// ## Wire convention
+    ///
+    /// The request payload is framed as `[cid: 16-byte BE u128][app_payload]`.
+    /// The responder MUST publish its reply to `reply_topic` with the same
+    /// `[cid: 16-byte BE u128][reply_payload]` layout. Replies whose first
+    /// 16 bytes do not match a pending cid are delivered to normal
+    /// subscribers on `reply_topic` (i.e. the RPC layer never disturbs
+    /// ordinary pub/sub traffic on the reply topic).
+    ///
+    /// The connection task lazily subscribes to `reply_topic` on first use
+    /// and stays subscribed for the connection's lifetime — repeated `rpc`
+    /// calls reuse the same subscription.
+    ///
+    /// ## Errors
+    ///
+    /// - [`RpcError::Timeout`] if no reply arrives within `timeout`.
+    /// - [`RpcError::NotConnected`] if the connection drops while waiting.
+    /// - [`RpcError::SubscribeFailed`] / [`RpcError::PublishFailed`] propagate
+    ///   the underlying pub/sub errors.
+    ///
+    /// # Errors
+    /// See [`RpcError`].
+    pub async fn rpc(
+        &self,
+        request_topic: &str,
+        payload: impl crate::message::Payload,
+        reply_topic: &str,
+        timeout: Duration,
+    ) -> Result<Message, RpcError> {
+        let app_payload: Bytes = payload.into_bytes();
+        let cid = next_rpc_cid();
+
+        // Register the reply handler before publishing so the connection
+        // task is guaranteed to be ready to intercept the reply even if
+        // the responder is faster than the scheduler round-trip.
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(ConnCmd::RegisterRpcReply {
+                cid,
+                reply_topic: reply_topic.to_string(),
+                resp: tx,
+            })
+            .await
+            .map_err(|_| RpcError::NotConnected)?;
+
+        // Frame the request: `[cid BE][app_payload]`.
+        let mut framed = Vec::with_capacity(16 + app_payload.len());
+        framed.extend_from_slice(&cid.to_be_bytes());
+        framed.extend_from_slice(&app_payload);
+        if let Err(e) = self.publish(request_topic, framed).await {
+            // Best-effort cancel to free the slot; ignore send error since
+            // the connection is already failing.
+            let _ = self.tx.try_send(ConnCmd::CancelRpc { cid });
+            return Err(RpcError::PublishFailed(e));
+        }
+
+        // Await reply with timeout.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(RpcError::NotConnected),
+            Err(_) => {
+                let _ = self.tx.try_send(ConnCmd::CancelRpc { cid });
+                Err(RpcError::Timeout(timeout))
+            }
+        }
+    }
+
     /// Fire-and-forget publish — enqueues the frame without waiting for the
     /// connection task to confirm.  This avoids the per-publish oneshot
     /// round-trip (which costs ~2 ms of scheduler latency) and is the right
@@ -355,6 +461,16 @@ struct TaskState {
     default_drops: u64,
     /// Aggregate drop count for dedicated streams. Same rationale.
     stream_drops: u64,
+    /// Pending RPC reply handlers keyed by 16-byte correlation id.
+    /// Populated by `RegisterRpcReply`; drained when a matching inbound
+    /// publish arrives on a `rpc_reply_topics` topic, or by `CancelRpc`
+    /// (sent on caller timeout / drop).
+    pending_rpcs: HashMap<u128, oneshot::Sender<Message>>,
+    /// Reply topics the task has already sent a Subscribe frame for.
+    /// Membership means: "inbound publishes on this topic MAY be RPC
+    /// replies — peek the first 16 payload bytes for a matching cid
+    /// before normal fan-out."
+    rpc_reply_topics: HashSet<String>,
 }
 
 /// Log drop counters every Nth drop. Chosen so a brief overload
@@ -394,6 +510,8 @@ impl TaskState {
             close_resp: None,
             default_drops: 0,
             stream_drops: 0,
+            pending_rpcs: HashMap::new(),
+            rpc_reply_topics: HashSet::new(),
         }
     }
 
@@ -438,6 +556,44 @@ impl TaskState {
             seq: frame.seq.get(),
             stream_id: sid,
         };
+
+        // ── RPC reply interceptor ──────────────────────────────────────
+        //
+        // Only inspects inbound publishes when ALL three conditions hold:
+        //   1. There is at least one pending RPC (cheap empty check first
+        //      to short-circuit when no RPC is in flight — zero overhead
+        //      on normal pub/sub traffic).
+        //   2. This topic is registered as a reply topic (precise routing:
+        //      a stray 16-byte-prefix collision on an unrelated topic is
+        //      never intercepted).
+        //   3. Payload is at least 16 bytes (the cid prefix).
+        //
+        // On match: strip the 16-byte cid, deliver to the oneshot, and
+        // skip normal fan-out. On no-match: fall through unchanged.
+        if !self.pending_rpcs.is_empty()
+            && !self.rpc_reply_topics.is_empty()
+            && msg.payload.len() >= 16
+        {
+            let topic_str = String::from_utf8_lossy(&topic_bytes);
+            if self.rpc_reply_topics.contains(topic_str.as_ref()) {
+                let mut cid_bytes = [0u8; 16];
+                cid_bytes.copy_from_slice(&msg.payload[..16]);
+                let cid = u128::from_be_bytes(cid_bytes);
+                if let Some(tx) = self.pending_rpcs.remove(&cid) {
+                    let stripped = Message {
+                        topic: msg.topic.clone(),
+                        payload: msg.payload.slice(16..),
+                        seq: msg.seq,
+                        stream_id: msg.stream_id,
+                    };
+                    // Receiver dropped (caller cancelled/panicked): the
+                    // entry is already removed above, so the leak is
+                    // bounded by `CancelRpc` cleanup on the timeout path.
+                    let _ = tx.send(stripped);
+                    return;
+                }
+            }
+        }
 
         if sid == DEFAULT_STREAM {
             // Fan out to every default-channel subscription whose pattern matches.
@@ -498,6 +654,38 @@ impl TaskState {
             ConnCmd::OpenStream { spec, resp } => {
                 let out = self.handle_open_stream(spec, transport);
                 let _ = resp.send(out);
+                false
+            }
+            ConnCmd::RegisterRpcReply { cid, reply_topic, resp } => {
+                // Lazy-subscribe to the reply topic on first use. Once
+                // joined, the topic is marked in `rpc_reply_topics` so the
+                // dispatch interceptor routes matching replies. Idempotent
+                // — repeated registrations for the same topic are free.
+                if !self.rpc_reply_topics.contains(&reply_topic) {
+                    let buf = encode_subscribe(&reply_topic, 0);
+                    let header = FrameHeader::new(StreamId::new(DEFAULT_STREAM), MessageType::Subscribe)
+                        .with_seq(self.next_seq(DEFAULT_STREAM));
+                    if let Err(e) = self.encode_and_send_raw(header, &buf, DEFAULT_STREAM, transport) {
+                        tracing::warn!(
+                            reply_topic = %reply_topic,
+                            error = %e,
+                            "[client] rpc: failed to subscribe to reply topic"
+                        );
+                        // Don't register the handler if we couldn't sub —
+                        // the caller's await on `resp` returns Closed when
+                        // the task drops `resp` here.
+                        return false;
+                    }
+                    if let Err(e) = transport.flush() {
+                        tracing::warn!(error = %e, "[client] rpc: flush failed");
+                    }
+                    self.rpc_reply_topics.insert(reply_topic);
+                }
+                self.pending_rpcs.insert(cid, resp);
+                false
+            }
+            ConnCmd::CancelRpc { cid } => {
+                self.pending_rpcs.remove(&cid);
                 false
             }
             ConnCmd::Close { resp } => {
@@ -954,6 +1142,14 @@ fn fail_cmd_not_connected(cmd: ConnCmd) {
         ConnCmd::OpenStream { resp, .. } => {
             let _ = resp.send(Err(StreamError::NotConnected));
         }
+        ConnCmd::RegisterRpcReply { resp, .. } => {
+            // Receiver awaits with a timeout — dropping `resp` here makes
+            // the caller's oneshot resolve to `RpcError::NotConnected`.
+            drop(resp);
+        }
+        ConnCmd::CancelRpc { .. } => {
+            // Nothing to ack — CancelRpc is fire-and-forget cleanup.
+        }
         ConnCmd::Close { resp } => {
             let _ = resp.send(Err(ConnectError::Closed(
                 "close requested during reconnect backoff".into(),
@@ -1089,5 +1285,152 @@ mod tests {
         let max = Duration::from_secs(60);
         let _ = backoff_for(u32::MAX, initial, max);
         let _ = backoff_for(31, initial, max);
+    }
+
+    // ── RPC dispatch interceptor tests ────────────────────────────────
+    //
+    // The interceptor lives inside TaskState::dispatch, so we exercise it
+    // by constructing a TaskState, registering a handler, and feeding it a
+    // synthetic inbound frame. No network / server required.
+
+    fn make_state() -> TaskState {
+        let (tx, _rx) = mpsc::channel(8);
+        let pending = Arc::new(AtomicUsize::new(0));
+        TaskState::new(8, 1024 * 1024, tx, pending)
+    }
+
+    fn make_publish_frame(topic: &str, body: &[u8]) -> frame::codec::Frame {
+        use frame::header::{FrameFlags, Seq, StreamId};
+        let mut payload = Vec::with_capacity(2 + topic.len() + body.len());
+        let topic_len = u16::try_from(topic.len()).unwrap_or(u16::MAX);
+        payload.extend_from_slice(&topic_len.to_be_bytes());
+        payload.extend_from_slice(topic.as_bytes());
+        payload.extend_from_slice(body);
+        frame::codec::Frame {
+            stream_id: StreamId::new(DEFAULT_STREAM),
+            seq: Seq::new(1),
+            msg_type: MessageType::Publish,
+            flags: FrameFlags::NONE,
+            payload: Bytes::from(payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_routes_matching_reply_to_oneshot() {
+        let mut st = make_state();
+        let cid: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEFu128;
+        st.rpc_reply_topics.insert("svc.reply".into());
+
+        let (tx, rx) = oneshot::channel();
+        st.pending_rpcs.insert(cid, tx);
+
+        // Reply body = 16-byte cid BE + app payload "hello"
+        let mut body = cid.to_be_bytes().to_vec();
+        body.extend_from_slice(b"hello");
+        st.dispatch(DEFAULT_STREAM, make_publish_frame("svc.reply", &body));
+
+        let msg = rx.await.expect("reply should arrive");
+        assert_eq!(msg.payload.as_ref(), b"hello");
+        assert_eq!(msg.stream_id, DEFAULT_STREAM);
+        // Slot must be drained.
+        assert!(st.pending_rpcs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_strips_cid_but_preserves_topic() {
+        let mut st = make_state();
+        let cid = 42u128;
+        st.rpc_reply_topics.insert("_rpc.reply".into());
+        let (tx, rx) = oneshot::channel();
+        st.pending_rpcs.insert(cid, tx);
+
+        st.dispatch(DEFAULT_STREAM, make_publish_frame("_rpc.reply", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 9, 9]));
+        let msg = rx.await.unwrap();
+        // Topic is preserved verbatim; only the payload's cid prefix is stripped.
+        assert_eq!(msg.topic.as_ref(), b"_rpc.reply");
+        assert_eq!(msg.payload.as_ref(), &[9, 9]);
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_ignores_unmatched_cid_on_reply_topic() {
+        let mut st = make_state();
+        st.rpc_reply_topics.insert("svc.reply".into());
+        let (tx, mut rx) = oneshot::channel();
+        st.pending_rpcs.insert(100u128, tx);
+
+        // Wrong cid — should NOT be routed to oneshot. Should fall through
+        // to normal fan-out (which is empty, so the message is silently
+        // dropped — but the oneshot stays pending).
+        let wrong_cid = 999u128;
+        st.dispatch(
+            DEFAULT_STREAM,
+            make_publish_frame("svc.reply", &wrong_cid.to_be_bytes()),
+        );
+
+        // Oneshot still pending — no immediate reply.
+        tokio::select! {
+            biased;
+            _ = &mut rx => panic!("unmatched cid must not deliver"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(st.pending_rpcs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_skipped_when_no_pending_rpc() {
+        // No pending RPCs at all — interceptor is a no-op even on a known
+        // reply topic. Important: zero overhead path on regular traffic.
+        let mut st = make_state();
+        st.rpc_reply_topics.insert("svc.reply".into());
+        // Should not panic / not interfere with fan-out.
+        st.dispatch(
+            DEFAULT_STREAM,
+            make_publish_frame("svc.reply", &[0u8; 32]),
+        );
+        // Nothing to assert beyond "didn't panic". The fan-out path runs
+        // and finds zero matching subs (state has none registered).
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_skipped_when_topic_not_registered() {
+        // Even with a pending RPC, replies on an unrelated topic must NOT
+        // be intercepted — otherwise regular publishes whose first 16
+        // bytes happen to collide with a cid would be silently swallowed.
+        let mut st = make_state();
+        let cid = 7u128;
+        let (tx, _rx) = oneshot::channel();
+        st.pending_rpcs.insert(cid, tx);
+        // Note: "unrelated.topic" is NOT in rpc_reply_topics.
+
+        // Send a publish with first 16 bytes == cid on an unrelated topic.
+        st.dispatch(
+            DEFAULT_STREAM,
+            make_publish_frame("unrelated.topic", &cid.to_be_bytes()),
+        );
+
+        // The pending entry should remain because interceptor didn't fire.
+        assert_eq!(st.pending_rpcs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_interceptor_handles_short_payload_gracefully() {
+        // Reply with < 16-byte payload must NOT be intercepted even on a
+        // reply topic (defensive: short replies fall through to fan-out).
+        let mut st = make_state();
+        st.rpc_reply_topics.insert("svc.reply".into());
+        let (tx, _rx) = oneshot::channel();
+        st.pending_rpcs.insert(1u128, tx);
+
+        st.dispatch(DEFAULT_STREAM, make_publish_frame("svc.reply", &[1, 2, 3]));
+        assert_eq!(st.pending_rpcs.len(), 1, "short payload must not match");
+    }
+
+    #[tokio::test]
+    async fn next_rpc_cid_is_strictly_monotonic() {
+        let a = next_rpc_cid();
+        let b = next_rpc_cid();
+        let c = next_rpc_cid();
+        assert!(b > a, "cid must increase: a={a}, b={b}");
+        assert!(c > b, "cid must increase: b={b}, c={c}");
     }
 }
