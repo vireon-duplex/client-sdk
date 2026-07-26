@@ -93,6 +93,31 @@ pub enum StreamError {
     NotConnected,
 }
 
+/// Failure of a request/reply RPC call.
+///
+/// RPC semantics are layered on top of plain pub/sub: the caller publishes
+/// a request whose payload is prefixed with a 16-byte correlation id, and
+/// awaits a reply (carrying the same id prefix) on a reply topic. This
+/// error captures every failure mode of that flow.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    /// The connection dropped before a reply arrived.
+    #[error("not connected")]
+    NotConnected,
+
+    /// Could not subscribe to the reply topic (server rejected the pattern).
+    #[error("subscribe failed: {0}")]
+    SubscribeFailed(#[from] SubscribeError),
+
+    /// Could not send the request frame.
+    #[error("publish failed: {0}")]
+    PublishFailed(#[from] PublishError),
+
+    /// No reply arrived within the requested deadline.
+    #[error("rpc timed out after {0:?}")]
+    Timeout(std::time::Duration),
+}
+
 /// Wraps the wire-level [`FrameError`] so callers get a single decode type.
 ///
 /// [`FrameError`]: frame::error::FrameError
