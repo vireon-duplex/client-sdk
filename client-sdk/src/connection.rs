@@ -34,9 +34,6 @@ use crate::stream::{StreamHandle, StreamSpec};
 use crate::transport::Transport;
 use crate::DeliveryPolicy;
 
-/// Depth of the command channel between [`Client`] handles and the task.
-pub(crate) const CMD_CHANNEL_CAP: usize = 256;
-
 /// Maximum commands processed per outer-loop iteration. Without this cap,
 /// a `try_publish` flood monopolises the worker thread inside the batch
 /// drain loop, starving other tasks (notably the subscriber's connection
@@ -728,12 +725,26 @@ pub(crate) async fn run(
                             }
                         }
                         if exit {
+                            // Process any remaining commands enqueued BEFORE
+                            // Close arrived. With a deep cmd channel, many
+                            // Publish commands may still be queued; if we
+                            // skip them, their data is lost. Each Publish
+                            // lands in quiche's send buffer or Transport's
+                            // pending — the subsequent drain flushes both.
+                            while let Ok(cmd) = rx.try_recv() {
+                                let _ = state.handle_cmd(cmd, &mut transport);
+                            }
                             // Graceful drain: flush any partial-write tails
                             // buffered in Transport::pending before sending
                             // CONNECTION_CLOSE. Without this, frames buffered
                             // by stream_send (awaiting a flow-control window
                             // from the peer) would be silently dropped.
-                            const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+                            //
+                            // 10 s covers the worst-case cmd-channel backlog:
+                            // CAP=4096 × 64 KiB = 256 MiB, at ~35 MiB/s that's
+                            // ~7 s. With small frames (8 KiB) pending is
+                            // typically <1 MB and drain returns in <100 ms.
+                            const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
                             if !transport.drain_pending_gracefully(DRAIN_TIMEOUT).await {
                                 tracing::warn!(
                                     pending_bytes = transport.pending_bytes(),
@@ -750,7 +761,7 @@ pub(crate) async fn run(
                     None => {
                         // All Client handles dropped — drain pending writes
                         // before closing so in-flight publishes aren't lost.
-                        const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+                        const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
                         if !transport.drain_pending_gracefully(DRAIN_TIMEOUT).await {
                             tracing::warn!(
                                 pending_bytes = transport.pending_bytes(),
