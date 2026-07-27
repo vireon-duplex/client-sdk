@@ -12,7 +12,12 @@
 //!  - [`connect_ready`] — retry-connect until the server is up.
 //!  - [`Histogram`] — tiny p50/p90/p99/p99.9/max latency aggregator.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,10 +45,8 @@ pub fn write_dev_cert() -> std::io::Result<(PathBuf, PathBuf)> {
     static KEY_PATH: OnceLock<PathBuf> = OnceLock::new();
     let id = std::process::id();
     let dir = std::env::temp_dir();
-    let cert_path =
-        CERT_PATH.get_or_init(|| dir.join(format!("vireon-bench-{id}-cert.pem")));
-    let key_path =
-        KEY_PATH.get_or_init(|| dir.join(format!("vireon-bench-{id}-key.pem")));
+    let cert_path = CERT_PATH.get_or_init(|| dir.join(format!("vireon-bench-{id}-cert.pem")));
+    let key_path = KEY_PATH.get_or_init(|| dir.join(format!("vireon-bench-{id}-key.pem")));
     std::fs::write(cert_path, cert_pem.as_bytes())?;
     std::fs::write(key_path, key_pem.as_bytes())?;
     Ok((cert_path.clone(), key_path.clone()))
@@ -133,7 +136,9 @@ impl Drop for ServerGuard {
             let pid = c.id() as i32;
             // SAFETY: kill(2) on a child PID we own; signal number is
             // validated by the libc constants.
-            unsafe { libc::kill(pid, libc::SIGINT); }
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
 
             // Poll for graceful exit (up to 3s).
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -248,7 +253,9 @@ pub async fn connect_ready_with_reconnect(
             }
             Err(_) => {
                 if tokio::time::Instant::now() >= deadline {
-                    panic!("could not connect to test server: connect_ready_with_reconnect deadline exceeded");
+                    panic!(
+                        "could not connect to test server: connect_ready_with_reconnect deadline exceeded"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
@@ -338,7 +345,10 @@ pub fn print_header(title: &str, duration: Duration, addr: &str) {
     println!();
     println!("═══════════════════════════════════════════════════════════════════════");
     println!("  {title}");
-    println!("  duration: {:.1}s   target: {addr}", duration.as_secs_f64());
+    println!(
+        "  duration: {:.1}s   target: {addr}",
+        duration.as_secs_f64()
+    );
     println!("═══════════════════════════════════════════════════════════════════════");
 }
 

@@ -33,8 +33,7 @@ mod bench_common;
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, fmt_ns, init_tracing, print_footer, print_header,
-    resolve_server,
+    connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
 };
 use vireon_sdk::{DeliveryPolicy, StreamSpec};
 
@@ -57,8 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  policy:    ReliableOrdered");
     println!("  frames:    {FRAME_COUNT}");
-    println!("  payload:   {PAYLOAD} B (16 B bench header + {rest} B fill)",
-        rest = PAYLOAD.saturating_sub(16));
+    println!(
+        "  payload:   {PAYLOAD} B (16 B bench header + {rest} B fill)",
+        rest = PAYLOAD.saturating_sub(16)
+    );
     println!();
 
     let sub = connect_ready(&addr).await;
@@ -66,9 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── open a dedicated ReliableOrdered stream ──────────────────────
     let stream = sub
-        .open_stream(
-            StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("seq.test"),
-        )
+        .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("seq.test"))
         .await
         .expect("open_stream");
     println!("  sub  stream id={} seq.test", stream.stream_id());
@@ -77,9 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // ── spawn subscriber collector ───────────────────────────────────
-    let collector = tokio::spawn(async move {
-        collect_and_verify(stream).await
-    });
+    let collector = tokio::spawn(async move { collect_and_verify(stream).await });
 
     // ── publish FRAME_COUNT frames with embedded sequence ───────────
     let mut buf = vec![0xAA_u8; PAYLOAD];
@@ -127,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && result.out_of_order == 0
         && result.received == FRAME_COUNT
     {
-        println!("  \u{2713} SEQUENCE INTEGRITY VERIFIED \u{2014} all {FRAME_COUNT} frames received once, in order.");
+        println!(
+            "  \u{2713} SEQUENCE INTEGRITY VERIFIED \u{2014} all {FRAME_COUNT} frames received once, in order."
+        );
     } else {
         println!("  \u{2717} SEQUENCE INTEGRITY FAILED \u{2014} see counters above.");
     }
@@ -154,12 +153,24 @@ async fn collect_and_verify(mut stream: vireon_sdk::StreamHandle) -> VerifyResul
     while let Some(msg) = stream.recv().await {
         if msg.payload.len() >= 16 {
             let ts = u64::from_be_bytes([
-                msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-                msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+                msg.payload[0],
+                msg.payload[1],
+                msg.payload[2],
+                msg.payload[3],
+                msg.payload[4],
+                msg.payload[5],
+                msg.payload[6],
+                msg.payload[7],
             ]);
             let seq = u64::from_be_bytes([
-                msg.payload[8], msg.payload[9], msg.payload[10], msg.payload[11],
-                msg.payload[12], msg.payload[13], msg.payload[14], msg.payload[15],
+                msg.payload[8],
+                msg.payload[9],
+                msg.payload[10],
+                msg.payload[11],
+                msg.payload[12],
+                msg.payload[13],
+                msg.payload[14],
+                msg.payload[15],
             ]);
             received.push(seq);
             let now = nanos();
