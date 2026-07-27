@@ -301,10 +301,9 @@ impl Transport {
 
         if offset < buf.len() {
             // Store the unwritten tail for retry on the next iteration.
-            // Using `truncate` would be wrong if the Vec was moved out
-            // above — clone the tail into the pending map.
-            let tail = buf[offset..].to_vec();
-            self.pending.insert(stream_id, BytesMut::from_iter(tail));
+            // Single allocation: BytesMut::from_iter copies the slice
+            // directly (previously .to_vec() + from_iter = 2 allocs).
+            self.pending.insert(stream_id, BytesMut::from_iter(&buf[offset..]));
         } else {
             // Everything written; clear any stale pending entry.
             self.pending.remove(&stream_id);
