@@ -81,5 +81,9 @@ path = "examples/s13_aggregate_throughput.rs"
 name = "s14_pool_multiplex"
 path = "examples/s14_pool_multiplex.rs"
 
+[[example]]
+name = "s15_consumer_group"
+path = "examples/s15_consumer_group.rs"
+
 [lints]
 workspace = true
