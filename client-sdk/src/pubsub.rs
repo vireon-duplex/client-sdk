@@ -37,3 +37,32 @@ impl Subscription {
         self.rx.recv().await
     }
 }
+
+/// Receiver for messages delivered to a consumer-group member.
+///
+/// Created by [`Client::subscribe_group`]; semantically distinct from
+/// [`Subscription`] because delivery is load-balanced across group members
+/// (round-robin) rather than fan-out to every subscriber.
+///
+/// [`Client::subscribe_group`]: crate::Client::subscribe_group
+pub struct GroupSubscription {
+    rx: mpsc::Receiver<Message>,
+}
+
+impl GroupSubscription {
+    /// Construct from a freshly-created receiver. Called only by the
+    /// connection task after it has registered the group membership and
+    /// stored the matching sender in its routing table.
+    #[inline]
+    #[must_use]
+    pub(crate) fn new(rx: mpsc::Receiver<Message>) -> Self {
+        Self { rx }
+    }
+
+    /// Await the next message delivered to this group member, or `None` when
+    /// the subscription has been closed.
+    #[inline]
+    pub async fn recv(&mut self) -> Option<Message> {
+        self.rx.recv().await
+    }
+}
