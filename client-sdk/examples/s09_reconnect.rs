@@ -42,13 +42,13 @@
 #[path = "_bench_common.rs"]
 mod bench_common;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, connect_ready_with_reconnect, ephemeral_port, init_tracing, print_footer,
-    print_header, write_dev_cert, ServerGuard,
+    ServerGuard, connect_ready, connect_ready_with_reconnect, ephemeral_port, init_tracing,
+    print_footer, print_header, write_dev_cert,
 };
 use vireon_sdk::{DeliveryPolicy, ReconnectPolicy, StreamSpec};
 
@@ -92,9 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── open a dedicated ReliableOrdered stream ──────────────────────
     let stream = sub
-        .open_stream(
-            StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("rc.test"),
-        )
+        .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("rc.test"))
         .await
         .expect("open_stream");
     println!("  sub  stream id={} rc.test", stream.stream_id());
@@ -126,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // server dies with active QUIC connections (io_uring + REUSEPORT).
     // Binding server2 to the same port appears to succeed but no
     // packets arrive. Using a fresh port sidesteps the issue entirely.
-    println!("\n  \u{27f3} killing server \u{2014} restarting on fresh port (ghost socket mitigation)\u{2026}");
+    println!(
+        "\n  \u{27f3} killing server \u{2014} restarting on fresh port (ghost socket mitigation)\u{2026}"
+    );
     drop(server1);
     let kill_time = Instant::now();
 
@@ -174,12 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     let stream2 = sub2
-        .open_stream(
-            StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("rc.test"),
-        )
+        .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("rc.test"))
         .await
         .expect("open_stream (post-restart)");
-    println!("  sub2 stream id={} rc.test (replayed)", stream2.stream_id());
+    println!(
+        "  sub2 stream id={} rc.test (replayed)",
+        stream2.stream_id()
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -198,9 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let phase2_published = publish_burst(&pub2, "rc.test", phase2_deadline).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let phase2_received = recv_count2.load(Ordering::Relaxed);
-    println!(
-        "  Phase 2: published {phase2_published}, received {phase2_received}"
-    );
+    println!("  Phase 2: published {phase2_published}, received {phase2_received}");
 
     // ── close everything ─────────────────────────────────────────────
     pub2.close().await.ok();

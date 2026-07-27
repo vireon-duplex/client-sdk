@@ -48,8 +48,8 @@ mod bench_common;
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, fmt_bps, fmt_ns, init_tracing, print_footer, print_header,
-    resolve_server, Histogram,
+    Histogram, connect_ready, fmt_bps, fmt_ns, init_tracing, print_footer, print_header,
+    resolve_server,
 };
 use tokio::task::JoinHandle;
 use vireon_sdk::{Client, DeliveryPolicy, StreamHandle, StreamSpec};
@@ -172,7 +172,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .open_stream(StreamSpec::new(w.policy).with_topic(w.topic))
             .await
             .expect("open_stream");
-        println!("  sub  stream id={} {:<6} {}", s.stream_id(), w.name, w.topic);
+        println!(
+            "  sub  stream id={} {:<6} {}",
+            s.stream_id(),
+            w.name,
+            w.topic
+        );
         streams.push(s);
     }
 
@@ -184,9 +189,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut sub_handles: Vec<JoinHandle<StreamStats>> = Vec::with_capacity(WORKLOADS.len());
     for (w, stream) in WORKLOADS.iter().zip(streams) {
         let name = w.name;
-        sub_handles.push(tokio::spawn(async move {
-            collect_stream(stream, name).await
-        }));
+        sub_handles.push(tokio::spawn(
+            async move { collect_stream(stream, name).await },
+        ));
     }
 
     // ── spawn 5 publisher loops on the default channel ─────────────
@@ -274,7 +279,11 @@ async fn publish_loop(
         }
         // Inner burst loop — fire `burst` messages back-to-back. For video
         // (burst==0) this loop runs until deadline with no sleep.
-        let target = if burst == 0 { usize::MAX } else { burst as usize };
+        let target = if burst == 0 {
+            usize::MAX
+        } else {
+            burst as usize
+        };
         for _ in 0..target {
             if Instant::now() >= deadline {
                 return seq;
@@ -325,8 +334,14 @@ async fn collect_stream(mut stream: StreamHandle, name: &'static str) -> StreamS
         stats.bytes += msg.payload.len() as u64;
         if msg.payload.len() >= 8 {
             let ts = u64::from_be_bytes([
-                msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-                msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+                msg.payload[0],
+                msg.payload[1],
+                msg.payload[2],
+                msg.payload[3],
+                msg.payload[4],
+                msg.payload[5],
+                msg.payload[6],
+                msg.payload[7],
             ]);
             let now = nanos();
             if now >= ts {
@@ -346,7 +361,9 @@ fn print_summary(results: &[(String, StreamStats)], published: &[(String, u64)])
         "  {:<8} {:<18} {:>9} {:>9} {:>7} {:>12} {:>10} {:>10}  {}",
         "stream", "policy", "pub/s", "recv/s", "deliver%", "throughput", "p50", "p99", "status"
     );
-    println!("  ───────────────────────────────────────────────────────────────────────────────────────────────");
+    println!(
+        "  ───────────────────────────────────────────────────────────────────────────────────────────────"
+    );
 
     for (name, s) in results {
         let w = WORKLOADS.iter().find(|x| x.name == name).expect("workload");
@@ -370,8 +387,16 @@ fn print_summary(results: &[(String, StreamStats)], published: &[(String, u64)])
             ("healthy", "✓")
         };
 
-        let p50 = s.hist.percentile(50.0).map(fmt_ns).unwrap_or_else(|| "—".into());
-        let p99 = s.hist.percentile(99.0).map(fmt_ns).unwrap_or_else(|| "—".into());
+        let p50 = s
+            .hist
+            .percentile(50.0)
+            .map(fmt_ns)
+            .unwrap_or_else(|| "—".into());
+        let p99 = s
+            .hist
+            .percentile(99.0)
+            .map(fmt_ns)
+            .unwrap_or_else(|| "—".into());
 
         println!(
             "  {:<8} {:<18} {:>9.0} {:>9.0} {:>6.1}% {:>12} {:>10} {:>10}  {} {}",
@@ -387,7 +412,9 @@ fn print_summary(results: &[(String, StreamStats)], published: &[(String, u64)])
             status,
         );
     }
-    println!("  ────────────────────────────────────────────────────────────────────────────────────");
+    println!(
+        "  ────────────────────────────────────────────────────────────────────────────────────"
+    );
 
     // Verdict line: if every non-video stream delivered ≥ 80% of what was
     // published, isolation held.
@@ -404,11 +431,16 @@ fn print_summary(results: &[(String, StreamStats)], published: &[(String, u64)])
         let pct = (s.received * 100) / pub_count.max(1);
         if pct < 80 {
             isolation_ok = false;
-            println!("  ✗ {name}: delivered {} / {} ({}%) — below 80% threshold", s.received, pub_count, pct);
+            println!(
+                "  ✗ {name}: delivered {} / {} ({}%) — below 80% threshold",
+                s.received, pub_count, pct
+            );
         }
     }
     if isolation_ok {
-        println!("  ✓ HOL ISOLATION VERIFIED — video congestion did not degrade the other streams.");
+        println!(
+            "  ✓ HOL ISOLATION VERIFIED — video congestion did not degrade the other streams."
+        );
     } else {
         println!("  ✗ HOL ISOLATION BROKEN — see per-stream delivery counts above.");
     }

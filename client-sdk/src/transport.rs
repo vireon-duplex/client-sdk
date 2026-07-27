@@ -76,14 +76,19 @@ impl Transport {
             .parse()
             .map_err(|e| ConnectError::Config(format!("invalid server address: {e}")))?;
 
-        let bind_addr = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind_addr = if peer.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let sock = UdpSocket::bind(bind_addr).await?;
         let local = sock.local_addr()?;
         // Pre-connect the socket so we can use try_recv/try_send (no send_to addr
         // lookups on the hot path) and so ICMP errors surface on recv.
         sock.connect(peer).await?;
 
-        let mut qcfg = build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
+        let mut qcfg =
+            build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
         let scid = quiche::ConnectionId::from_vec(gen_scid());
         let conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
 
@@ -153,7 +158,10 @@ impl Transport {
             match self.sock.try_recv_from(&mut self.recv_buf) {
                 Ok((n, from)) => {
                     got_data = true;
-                    let info = quiche::RecvInfo { from, to: self.local };
+                    let info = quiche::RecvInfo {
+                        from,
+                        to: self.local,
+                    };
                     match self.conn.recv(&mut self.recv_buf[..n], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
                         Err(e) => {
@@ -242,7 +250,9 @@ impl Transport {
         payload: &[u8],
         stream_id: u64,
     ) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::with_capacity(frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE);
+        let mut buf = BytesMut::with_capacity(
+            frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE,
+        );
         frame::codec::encode_into(&mut buf, header, payload)
             .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
         self.stream_send(stream_id, &buf)
@@ -303,7 +313,8 @@ impl Transport {
             // Store the unwritten tail for retry on the next iteration.
             // Single allocation: BytesMut::from_iter copies the slice
             // directly (previously .to_vec() + from_iter = 2 allocs).
-            self.pending.insert(stream_id, BytesMut::from_iter(&buf[offset..]));
+            self.pending
+                .insert(stream_id, BytesMut::from_iter(&buf[offset..]));
         } else {
             // Everything written; clear any stale pending entry.
             self.pending.remove(&stream_id);
@@ -371,7 +382,8 @@ impl Transport {
     /// Sync the shared atomic to match the actual pending total. Called
     /// after every mutation of `pending` so publishers see a current value.
     fn sync_pending_shared(&self) {
-        self.pending_shared.store(self.pending_bytes(), Ordering::Relaxed);
+        self.pending_shared
+            .store(self.pending_bytes(), Ordering::Relaxed);
     }
 
     /// Retry pending partial writes before flushing. Called at the top of
@@ -404,14 +416,12 @@ impl Transport {
     pub(crate) fn flush(&mut self) -> Result<(), ConnectError> {
         loop {
             match self.conn.send(&mut self.send_buf) {
-                Ok((n, info)) => {
-                    match self.sock.try_send_to(&self.send_buf[..n], info.to) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(ConnectError::Io(e)),
-                    }
-                }
+                Ok((n, info)) => match self.sock.try_send_to(&self.send_buf[..n], info.to) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(ConnectError::Io(e)),
+                },
                 Err(quiche::Error::Done) => return Ok(()),
                 Err(e) => return Err(ConnectError::Quiche(e)),
             }
@@ -502,14 +512,12 @@ fn build_quiche_config(
     // handshake starts. Independent of TlsVerify: a client can both
     // pin the server cert (Strict/Pinned) and present its own.
     if let Some(id) = client_identity {
-        let cert_str = id
-            .cert
-            .to_str()
-            .ok_or_else(|| ConnectError::Tls(format!("cert path not valid UTF-8: {}", id.cert.display())))?;
-        let key_str = id
-            .key
-            .to_str()
-            .ok_or_else(|| ConnectError::Tls(format!("key path not valid UTF-8: {}", id.key.display())))?;
+        let cert_str = id.cert.to_str().ok_or_else(|| {
+            ConnectError::Tls(format!("cert path not valid UTF-8: {}", id.cert.display()))
+        })?;
+        let key_str = id.key.to_str().ok_or_else(|| {
+            ConnectError::Tls(format!("key path not valid UTF-8: {}", id.key.display()))
+        })?;
         config
             .load_cert_chain_from_pem_file(cert_str)
             .map_err(|e| ConnectError::Tls(format!("failed to load client cert: {e}")))?;
@@ -541,9 +549,9 @@ fn build_quiche_config(
     // path so the common cases are honest about what they do.
     match tls {
         TlsVerify::Strict { ca } => {
-            let ca_str = ca
-                .to_str()
-                .ok_or_else(|| ConnectError::Tls(format!("CA path not valid UTF-8: {}", ca.display())))?;
+            let ca_str = ca.to_str().ok_or_else(|| {
+                ConnectError::Tls(format!("CA path not valid UTF-8: {}", ca.display()))
+            })?;
             config
                 .load_verify_locations_from_file(ca_str)
                 .map_err(|e| ConnectError::Tls(format!("failed to load CA bundle: {e}")))?;

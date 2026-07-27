@@ -17,10 +17,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::DeliveryPolicy;
 use crate::connection::{ConnCmd, StreamSel};
 use crate::error::PublishError;
 use crate::message::Message;
-use crate::DeliveryPolicy;
 
 /// Specification for a dedicated stream.
 ///
@@ -107,7 +107,8 @@ impl StreamHandle {
     /// timeout.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.pending_shared.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_shared
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Await the next message delivered on this stream, or `None` when the
@@ -125,7 +126,11 @@ impl StreamHandle {
     /// leaves on this stream's id.
     ///
     /// [`Client::publish`]: crate::Client::publish
-    pub async fn publish(&self, topic: &str, payload: impl crate::message::Payload) -> Result<(), PublishError> {
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: impl crate::message::Payload,
+    ) -> Result<(), PublishError> {
         let payload: Bytes = payload.into_bytes();
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnCmd::Publish {

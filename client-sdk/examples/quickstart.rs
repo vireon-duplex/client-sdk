@@ -98,10 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         latest.stream_id(),
         realtime.stream_id(),
     );
-    println!(
-        "  {:<20} {:<18}",
-        "ReliableOrdered", "qs.data"
-    );
+    println!("  {:<20} {:<18}", "ReliableOrdered", "qs.data");
     println!("  {:<20} {:<18}", "LatestOnly", "qs.cursor");
     println!("  {:<20} {:<18}", "RealtimeDropOld", "qs.events");
 
@@ -113,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // → independent flow control → a slow or blocked stream never stalls
     // the others. Three tokio tasks run concurrently, each calling
     // try_publish on its own StreamHandle.
-    println!("\n[publish] sending {BURST} frames per stream (parallel, per-stream QUIC flow control)…");
+    println!(
+        "\n[publish] sending {BURST} frames per stream (parallel, per-stream QUIC flow control)…"
+    );
 
     let pub_data = pub_client
         .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("qs.data"))
@@ -162,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── summary ──────────────────────────────────────────────────────
     println!("\n┌───────────────────────────────────────────────────────────");
-    println!("│ {:<20} {:>8}  {:>10}  {:>10}", "stream", "recv", "p50", "p99");
+    println!(
+        "│ {:<20} {:>8}  {:>10}  {:>10}",
+        "stream", "recv", "p50", "p99"
+    );
     println!("│ {}", "-".repeat(56));
     for (name, s) in [
         ("ReliableOrdered", &r),
@@ -212,8 +214,14 @@ async fn collect(mut stream: vireon_sdk::StreamHandle, _label: &str) -> Stats {
         count += 1;
         if msg.payload.len() >= 8 {
             let ts = u64::from_be_bytes([
-                msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-                msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+                msg.payload[0],
+                msg.payload[1],
+                msg.payload[2],
+                msg.payload[3],
+                msg.payload[4],
+                msg.payload[5],
+                msg.payload[6],
+                msg.payload[7],
             ]);
             let now = nanos();
             if now >= ts {
