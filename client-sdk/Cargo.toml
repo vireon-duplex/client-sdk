@@ -1,0 +1,85 @@
+[package]
+name = "vireon-sdk"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+autobenches = false
+autoexamples = false
+description = "Production-grade async client SDK for the Vireon QUIC-native pub/sub runtime."
+readme = "README.md"
+
+[lib]
+name = "vireon_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+# Vireon message layer — wire codec (22-byte header + CRC32C) and typed payloads.
+frame = { path = "../message-layer/frame" }
+
+# Per-stream delivery policy + StreamOpen wire meta (single source of truth for
+# the StreamOpen payload byte the server decodes at application.rs:2144).
+send-policy = { path = "../stream-layer/send-policy" }
+
+# QUIC transport (BoringSSL TLS 1.3).
+quiche = { workspace = true }
+
+# Async runtime — the SDK is tokio-based; the server keeps its io_uring reactor.
+tokio = { workspace = true }
+
+# Networking primitives (non-blocking UDP, SocketAddr derivation).
+socket2 = { workspace = true }
+libc = { workspace = true }
+
+# Byte buffers (reference-counted payloads — cheap to clone across subscribers).
+bytes = { workspace = true }
+
+# Error handling — typed errors only, no anyhow in the public API.
+thiserror = { workspace = true }
+
+# Structured logging (reconnect / decode / backpressure diagnostics).
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+rcgen = "0.13"
+tracing-subscriber = { workspace = true }
+
+# Explicit example list: anything under examples/ that is NOT listed here is
+# treated as a path-include-only module (e.g. _bench_common.rs is a shared
+# helper, not a standalone binary).
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"
+
+[[example]]
+name = "s07_hol_congestion"
+path = "examples/s07_hol_congestion.rs"
+
+[[example]]
+name = "s09_reconnect"
+path = "examples/s09_reconnect.rs"
+
+[[example]]
+name = "s10_mtls"
+path = "examples/s10_mtls.rs"
+
+[[example]]
+name = "s11_ordering"
+path = "examples/s11_ordering.rs"
+
+[[example]]
+name = "s12_full_limit"
+path = "examples/s12_full_limit.rs"
+
+[[example]]
+name = "s13_aggregate_throughput"
+path = "examples/s13_aggregate_throughput.rs"
+
+[[example]]
+name = "s14_pool_multiplex"
+path = "examples/s14_pool_multiplex.rs"
+
+[lints]
+workspace = true
