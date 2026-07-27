@@ -93,6 +93,18 @@ pub enum StreamError {
     NotConnected,
 }
 
+/// Failure to join / leave a consumer group.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupError {
+    /// The topic, group, or consumer id was rejected by the server.
+    #[error("rejected: {0}")]
+    Rejected(String),
+
+    /// The connection is no longer usable.
+    #[error("not connected")]
+    NotConnected,
+}
+
 /// Failure of a request/reply RPC call.
 ///
 /// RPC semantics are layered on top of plain pub/sub: the caller publishes
