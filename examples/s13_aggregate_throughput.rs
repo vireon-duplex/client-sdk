@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server, Histogram,
+    Histogram, connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
 };
 use vireon_sdk::{DeliveryPolicy, StreamSpec};
 
@@ -146,9 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .worker_threads(workers)
         .enable_all()
         .build()?
-        .block_on(async move {
-            run().await
-        })
+        .block_on(async move { run().await })
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -175,9 +173,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  pairs:        {n_pubs}   (each pair = 1 pub conn + 1 sub conn)");
     println!("  streams/pair: {n_streams}   (parallel QUIC streams per pair)");
-    println!("  tokio workers: {}   (override: S13_WORKERS=N)", worker_threads());
+    println!(
+        "  tokio workers: {}   (override: S13_WORKERS=N)",
+        worker_threads()
+    );
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
-    println!("  duration:     {:.1}s   (+ up to {}s drain)", dur.as_secs_f64(), drain.as_secs());
+    println!(
+        "  duration:     {:.1}s   (+ up to {}s drain)",
+        dur.as_secs_f64(),
+        drain.as_secs()
+    );
     println!("  total streams in flight: {}", n_pubs * n_streams);
     println!("  topic prefix: {topic_prefix}   (e.g. {topic_prefix}.p0s0, {topic_prefix}.p1s3)");
     println!();
@@ -189,17 +194,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("┌──────────────────────────────────────────────────────────────");
     println!("│  AGGREGATE THROUGHPUT RESULT");
     println!("├──────────────────────────────────────────────────────────────");
-    println!("│  published:    {:.3} GiB  ({:.1} MiB)", result.gib_sent, result.mib_sent);
-    println!("│  delivered:    {:.3} GiB  ({:.1} MiB)", result.gib_recv, result.mib_recv);
+    println!(
+        "│  published:    {:.3} GiB  ({:.1} MiB)",
+        result.gib_sent, result.mib_sent
+    );
+    println!(
+        "│  delivered:    {:.3} GiB  ({:.1} MiB)",
+        result.gib_recv, result.mib_recv
+    );
     println!(
         "│  loss:         {:.2}%  ({} sent vs {} recv bytes)",
         result.loss_pct, result.bytes_sent, result.bytes_recv,
     );
     println!("│");
-    println!("│  publish rate:    {:.2} GiB/s  ({:.0} MiB/s)",
-        result.publish_gibs, result.publish_mibs);
-    println!("│  delivery rate:   {:.2} GiB/s  ({:.0} MiB/s)",
-        result.delivery_gibs, result.delivery_mibs);
+    println!(
+        "│  publish rate:    {:.2} GiB/s  ({:.0} MiB/s)",
+        result.publish_gibs, result.publish_mibs
+    );
+    println!(
+        "│  delivery rate:   {:.2} GiB/s  ({:.0} MiB/s)",
+        result.delivery_gibs, result.delivery_mibs
+    );
     println!("│");
     println!("│  frames sent:     {}", result.frames_sent);
     println!("│  frames recv:     {}", result.frames_recv);
@@ -222,7 +237,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             fmt_ns(result.lat_p50.unwrap_or(0)),
         );
     } else {
-        println!("\n  ◯ {:.0} MiB/s — {:.1}% loss.", result.delivery_mibs, result.loss_pct);
+        println!(
+            "\n  ◯ {:.0} MiB/s — {:.1}% loss.",
+            result.delivery_mibs, result.loss_pct
+        );
         println!("    Backpressure threshold hit — subscriber can't keep up.");
         println!("    • Try fewer streams (S13_STREAMS=1) to reduce per-conn contention");
         println!("    • Try smaller frames (S13_FRAME_SIZE=4096) to reduce per-frame cost");
@@ -281,9 +299,7 @@ async fn run_config(
             // and would otherwise amplify fan-out and corrupt metrics).
             let topic = format!("{topic_prefix}.p{p}s{s}");
             let stream = c
-                .open_stream(
-                    StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic),
-                )
+                .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic))
                 .await?;
             sub_streams.push((topic, stream));
         }
@@ -302,9 +318,7 @@ async fn run_config(
         for s in 0..n_streams {
             let topic = format!("{topic_prefix}.p{p}s{s}");
             let stream = c
-                .open_stream(
-                    StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic),
-                )
+                .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(&topic))
                 .await?;
             pub_streams.push((topic, stream));
         }
@@ -332,8 +346,14 @@ async fn run_config(
                 br.fetch_add(msg.payload.len() as u64, Ordering::Relaxed);
                 if msg.payload.len() >= 8 {
                     let ts = u64::from_be_bytes([
-                        msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-                        msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+                        msg.payload[0],
+                        msg.payload[1],
+                        msg.payload[2],
+                        msg.payload[3],
+                        msg.payload[4],
+                        msg.payload[5],
+                        msg.payload[6],
+                        msg.payload[7],
                     ]);
                     let now = nanos();
                     if now >= ts {
@@ -355,7 +375,9 @@ async fn run_config(
         let fs = frames_sent.clone();
         let stop = stop.clone();
         let br = bytes_recv.clone();
-        pub_tasks.push(tokio::spawn(publisher_loop(stream, topic, sz, bs, fs, stop, br)));
+        pub_tasks.push(tokio::spawn(publisher_loop(
+            stream, topic, sz, bs, fs, stop, br,
+        )));
     }
 
     // ── run for `dur`, then stop publishers ─────────────────────────

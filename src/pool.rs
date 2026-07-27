@@ -33,8 +33,8 @@
 //! publishes to whichever members are alive; a dead member simply returns
 //! `NotConnected` and the failover walks past it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -157,11 +157,7 @@ impl ClientPool {
     /// briefly to let the server drain.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.inner
-            .members
-            .iter()
-            .map(|c| c.pending_bytes())
-            .sum()
+        self.inner.members.iter().map(|c| c.pending_bytes()).sum()
     }
 
     /// Pick the next round-robin index (wrap-around).

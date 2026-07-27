@@ -28,13 +28,13 @@ use frame::header::{MessageType, Seq, StreamId};
 use send_policy::StreamOpenMeta;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::DeliveryPolicy;
 use crate::config::ClientConfig;
 use crate::error::{ConnectError, PublishError, RpcError, StreamError, SubscribeError};
 use crate::message::Message;
 use crate::pubsub::Subscription;
 use crate::stream::{StreamHandle, StreamSpec};
 use crate::transport::Transport;
-use crate::DeliveryPolicy;
 
 /// Maximum commands processed per outer-loop iteration. Without this cap,
 /// a `try_publish` flood monopolises the worker thread inside the batch
@@ -161,7 +161,8 @@ impl Client {
     /// within its timeout.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.pending_shared.load(std::sync::atomic::Ordering::Relaxed)
+        self.pending_shared
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Subscribe to a topic pattern on the default channel.
@@ -173,7 +174,8 @@ impl Client {
     /// # Errors
     /// [`SubscribeError::NotConnected`] if the connection is gone.
     pub async fn subscribe(&self, pattern: &str) -> Result<Subscription, SubscribeError> {
-        self.subscribe_with_qos(pattern, crate::message::Qos::default()).await
+        self.subscribe_with_qos(pattern, crate::message::Qos::default())
+            .await
     }
 
     /// Subscribe with an explicit QoS byte.
@@ -222,7 +224,11 @@ impl Client {
     /// # Errors
     /// [`PublishError::NotConnected`] if the connection is gone, or
     /// [`PublishError::TooLarge`] if the payload exceeds the configured cap.
-    pub async fn publish(&self, topic: &str, payload: impl crate::message::Payload) -> Result<(), PublishError> {
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: impl crate::message::Payload,
+    ) -> Result<(), PublishError> {
         let payload: Bytes = payload.into_bytes();
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = ConnCmd::Publish {
@@ -370,7 +376,11 @@ impl Client {
     /// # Errors
     /// [`PublishError::NotConnected`] if the connection is gone or the
     /// command channel is full.
-    pub fn try_publish(&self, topic: &str, payload: impl crate::message::Payload) -> Result<(), PublishError> {
+    pub fn try_publish(
+        &self,
+        topic: &str,
+        payload: impl crate::message::Payload,
+    ) -> Result<(), PublishError> {
         let payload: Bytes = payload.into_bytes();
         let (resp_tx, _resp_rx) = oneshot::channel();
         let cmd = ConnCmd::Publish {
@@ -391,7 +401,10 @@ impl Client {
     /// [`StreamError::NotConnected`] if the connection is gone.
     pub async fn open_stream(&self, spec: StreamSpec) -> Result<StreamHandle, StreamError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let cmd = ConnCmd::OpenStream { spec, resp: resp_tx };
+        let cmd = ConnCmd::OpenStream {
+            spec,
+            resp: resp_tx,
+        };
         self.tx
             .send(cmd)
             .await
@@ -634,7 +647,12 @@ impl TaskState {
     /// Handle one command. Returns `true` if the task should exit after this.
     fn handle_cmd(&mut self, cmd: ConnCmd, transport: &mut Transport) -> bool {
         match cmd {
-            ConnCmd::Publish { topic, payload, stream, resp } => {
+            ConnCmd::Publish {
+                topic,
+                payload,
+                stream,
+                resp,
+            } => {
                 let out = self.handle_publish(&topic, &payload, stream, transport);
                 let _ = resp.send(out);
                 false
@@ -646,7 +664,13 @@ impl TaskState {
             }
             ConnCmd::Unsubscribe { pattern, resp } => {
                 self.subs.retain(|s| s.pattern != pattern);
-                let out = self.encode_and_send(MessageType::Unsubscribe, &encode_unsubscribe(&pattern), DEFAULT_STREAM, transport)
+                let out = self
+                    .encode_and_send(
+                        MessageType::Unsubscribe,
+                        &encode_unsubscribe(&pattern),
+                        DEFAULT_STREAM,
+                        transport,
+                    )
                     .map_err(|_| SubscribeError::NotConnected);
                 let _ = resp.send(out);
                 false
@@ -656,16 +680,23 @@ impl TaskState {
                 let _ = resp.send(out);
                 false
             }
-            ConnCmd::RegisterRpcReply { cid, reply_topic, resp } => {
+            ConnCmd::RegisterRpcReply {
+                cid,
+                reply_topic,
+                resp,
+            } => {
                 // Lazy-subscribe to the reply topic on first use. Once
                 // joined, the topic is marked in `rpc_reply_topics` so the
                 // dispatch interceptor routes matching replies. Idempotent
                 // — repeated registrations for the same topic are free.
                 if !self.rpc_reply_topics.contains(&reply_topic) {
                     let buf = encode_subscribe(&reply_topic, 0);
-                    let header = FrameHeader::new(StreamId::new(DEFAULT_STREAM), MessageType::Subscribe)
-                        .with_seq(self.next_seq(DEFAULT_STREAM));
-                    if let Err(e) = self.encode_and_send_raw(header, &buf, DEFAULT_STREAM, transport) {
+                    let header =
+                        FrameHeader::new(StreamId::new(DEFAULT_STREAM), MessageType::Subscribe)
+                            .with_seq(self.next_seq(DEFAULT_STREAM));
+                    if let Err(e) =
+                        self.encode_and_send_raw(header, &buf, DEFAULT_STREAM, transport)
+                    {
                         tracing::warn!(
                             reply_topic = %reply_topic,
                             error = %e,
@@ -713,8 +744,8 @@ impl TaskState {
             StreamSel::Dedicated(id) => id,
         };
         let buf = encode_publish(topic, payload);
-        let header = FrameHeader::new(StreamId::new(sid), MessageType::Publish)
-            .with_seq(self.next_seq(sid));
+        let header =
+            FrameHeader::new(StreamId::new(sid), MessageType::Publish).with_seq(self.next_seq(sid));
         // Bytes land in quiche's per-stream send buffer; the outer run() loop
         // flushes once per iteration. Skipping a per-publish flush here is what
         // makes batch publishes share a single UDP send syscall.
@@ -742,7 +773,9 @@ impl TaskState {
             .with_seq(self.next_seq(DEFAULT_STREAM));
         self.encode_and_send_raw(header, &buf, DEFAULT_STREAM, transport)
             .map_err(|_| SubscribeError::NotConnected)?;
-        transport.flush().map_err(|_| SubscribeError::NotConnected)?;
+        transport
+            .flush()
+            .map_err(|_| SubscribeError::NotConnected)?;
 
         Ok(Subscription::new(rx))
     }
@@ -753,14 +786,20 @@ impl TaskState {
         transport: &mut Transport,
     ) -> Result<StreamHandle, StreamError> {
         let sid = self.next_bidi;
-        self.next_bidi = self.next_bidi.checked_add(4).ok_or(StreamError::NoCapacity)?;
+        self.next_bidi = self
+            .next_bidi
+            .checked_add(4)
+            .ok_or(StreamError::NoCapacity)?;
 
         let (tx, rx) = mpsc::channel(self.subscriber_buffer);
-        self.streams.insert(sid, StreamEntry {
-            policy: spec.policy,
-            topic: spec.topic.clone(),
-            tx,
-        });
+        self.streams.insert(
+            sid,
+            StreamEntry {
+                policy: spec.policy,
+                topic: spec.topic.clone(),
+                tx,
+            },
+        );
 
         // 1) Declare the stream's delivery policy via StreamOpen. The payload
         //    MUST be the `StreamOpenMeta` byte — the server decodes exactly
@@ -783,7 +822,12 @@ impl TaskState {
 
         transport.flush().map_err(|_| StreamError::NotConnected)?;
 
-        Ok(StreamHandle::new(sid, rx, self.cmd_tx.clone(), self.pending_shared.clone()))
+        Ok(StreamHandle::new(
+            sid,
+            rx,
+            self.cmd_tx.clone(),
+            self.pending_shared.clone(),
+        ))
     }
 
     /// Re-send every active subscription and re-open every dedicated stream
@@ -903,7 +947,12 @@ pub(crate) async fn run(
         }
     };
 
-    let mut state = TaskState::new(cfg.subscriber_buffer, cfg.max_message_size, cmd_tx, pending_shared.clone());
+    let mut state = TaskState::new(
+        cfg.subscriber_buffer,
+        cfg.max_message_size,
+        cmd_tx,
+        pending_shared.clone(),
+    );
 
     // Dead-peer detection: quiche 0.22 has no built-in keepalive and ICMP
     // port-unreachable is not reliably surfaced on loopback. So we use a
@@ -1344,7 +1393,13 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         st.pending_rpcs.insert(cid, tx);
 
-        st.dispatch(DEFAULT_STREAM, make_publish_frame("_rpc.reply", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 9, 9]));
+        st.dispatch(
+            DEFAULT_STREAM,
+            make_publish_frame(
+                "_rpc.reply",
+                &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 9, 9],
+            ),
+        );
         let msg = rx.await.unwrap();
         // Topic is preserved verbatim; only the payload's cid prefix is stripped.
         assert_eq!(msg.topic.as_ref(), b"_rpc.reply");
@@ -1383,10 +1438,7 @@ mod tests {
         let mut st = make_state();
         st.rpc_reply_topics.insert("svc.reply".into());
         // Should not panic / not interfere with fan-out.
-        st.dispatch(
-            DEFAULT_STREAM,
-            make_publish_frame("svc.reply", &[0u8; 32]),
-        );
+        st.dispatch(DEFAULT_STREAM, make_publish_frame("svc.reply", &[0u8; 32]));
         // Nothing to assert beyond "didn't panic". The fan-out path runs
         // and finds zero matching subs (state has none registered).
     }

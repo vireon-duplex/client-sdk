@@ -8,7 +8,12 @@
 //!
 //! The test auto-builds the `quic-server` binary (incremental, fast once built).
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::print_stdout)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stdout
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -36,9 +41,10 @@ use vireon_sdk::{ClientBuilder, DeliveryPolicy, ReconnectPolicy, StreamSpec, Tls
 
 /// Write a self-signed cert + key to temp files; return their paths.
 fn write_dev_cert() -> std::io::Result<(PathBuf, PathBuf)> {
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("rcgen params");
-    params.distinguished_name.push(rcgen::DnType::CommonName, "localhost");
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).expect("rcgen params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
     let key = KeyPair::generate().expect("rcgen key");
     let cert = params.self_signed(&key).expect("rcgen self-signed");
     let cert_pem = cert.pem();
@@ -171,10 +177,7 @@ async fn pubsub_roundtrip_e2e() {
     let pub_client = connect_ready(&addr).await;
 
     // ── 1. default-channel wildcard subscribe + publish ─────────────
-    let mut sub = sub_client
-        .subscribe("test.*")
-        .await
-        .expect("subscribe");
+    let mut sub = sub_client.subscribe("test.*").await.expect("subscribe");
     // Let the server register the subscription before publishing.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -193,7 +196,10 @@ async fn pubsub_roundtrip_e2e() {
     println!("[e2e] default-channel roundtrip OK");
 
     // ── 2. wildcard non-match is NOT delivered ──────────────────────
-    pub_client.publish("other.topic", b"should-not-arrive").await.ok();
+    pub_client
+        .publish("other.topic", b"should-not-arrive")
+        .await
+        .ok();
     if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
         panic!("unexpected message on non-matching topic: {:?}", m.topic);
     }
@@ -206,9 +212,15 @@ async fn pubsub_roundtrip_e2e() {
         .open_stream(StreamSpec::new(DeliveryPolicy::LatestOnly).with_topic("cursor.move"))
         .await
         .expect("open stream");
-    assert!(stream.stream_id() > 0, "dedicated stream id must be non-zero");
+    assert!(
+        stream.stream_id() > 0,
+        "dedicated stream id must be non-zero"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    pub_client.publish("cursor.move", b"move(10,20)").await.expect("publish to cursor");
+    pub_client
+        .publish("cursor.move", b"move(10,20)")
+        .await
+        .expect("publish to cursor");
 
     let sm = tokio::time::timeout(Duration::from_secs(3), stream.recv())
         .await
@@ -216,7 +228,10 @@ async fn pubsub_roundtrip_e2e() {
         .expect("stream closed");
     assert_eq!(sm.topic, Bytes::from_static(b"cursor.move"));
     assert_eq!(sm.payload.as_ref(), b"move(10,20)");
-    println!("[e2e] dedicated-stream (LatestOnly) roundtrip OK, stream_id={}", stream.stream_id());
+    println!(
+        "[e2e] dedicated-stream (LatestOnly) roundtrip OK, stream_id={}",
+        stream.stream_id()
+    );
 
     sub_client.close().await.ok();
     pub_client.close().await.ok();
@@ -254,7 +269,10 @@ async fn reconnect_resumes_subscriptions() {
     // Subscribe on the default channel.
     let mut sub = sub_client.subscribe("chat.*").await.expect("subscribe");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    pub_client.publish("chat.hello", b"first").await.expect("publish 1");
+    pub_client
+        .publish("chat.hello", b"first")
+        .await
+        .expect("publish 1");
     let m = tokio::time::timeout(Duration::from_secs(3), sub.recv())
         .await
         .expect("timeout waiting for first message")
@@ -281,7 +299,9 @@ async fn reconnect_resumes_subscriptions() {
     // New publisher connection against the restarted server, then publish.
     let pub2 = connect_ready(&addr1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    pub2.publish("chat.after", b"second").await.expect("publish 2");
+    pub2.publish("chat.after", b"second")
+        .await
+        .expect("publish 2");
 
     let m = tokio::time::timeout(Duration::from_secs(5), sub.recv())
         .await

@@ -41,7 +41,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bench_common::{connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server, Histogram};
+use bench_common::{
+    Histogram, connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
+};
 use vireon_sdk::ClientPool;
 
 fn pool_size() -> usize {
@@ -100,10 +102,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &addr,
     );
     println!("  pool size:    {pool_n}   (parallel publisher connections)");
-    println!("  tokio workers: {}   (override: S14_WORKERS=N)", worker_threads());
+    println!(
+        "  tokio workers: {}   (override: S14_WORKERS=N)",
+        worker_threads()
+    );
     println!("  frames:       {total}");
     println!("  frame size:   {sz} B   ({:.1} KiB)", sz as f64 / 1024.0);
-    println!("  total bytes:  {:.2} MiB", total as f64 * sz as f64 / (1024.0 * 1024.0));
+    println!(
+        "  total bytes:  {:.2} MiB",
+        total as f64 * sz as f64 / (1024.0 * 1024.0)
+    );
     println!();
 
     // ── subscriber (single dedicated connection) ─────────────────────
@@ -196,12 +204,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("│  received:    {received}");
     println!("│  lost:        {lost}   ({loss_pct:.2}%)");
     println!("│  publish t:   {:.2}s", publish_elapsed.as_secs_f64());
-    println!("│  total t:     {:.2}s   (incl. drain)", elapsed.as_secs_f64());
+    println!(
+        "│  total t:     {:.2}s   (incl. drain)",
+        elapsed.as_secs_f64()
+    );
     if let Some(p50) = hist.percentile(50.0) {
         println!("│  e2e p50:     {}   (publish→recv)", fmt_ns(p50));
     }
-    println!("│  throughput:  {:.2} MiB/s",
-        received as f64 * sz as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0));
+    println!(
+        "│  throughput:  {:.2} MiB/s",
+        received as f64 * sz as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+    );
     println!("└──────────────────────────────────────────────────────────────");
 
     if loss_pct == 0.0 {
