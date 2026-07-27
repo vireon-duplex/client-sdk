@@ -23,14 +23,12 @@
 mod bench_common;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bench_common::{ephemeral_port, init_tracing, print_footer, print_header, ServerGuard};
-use vireon_sdk::{
-    ClientBuilder, ClientIdentity, DeliveryPolicy, StreamSpec, TlsVerify,
-};
+use bench_common::{ServerGuard, ephemeral_port, init_tracing, print_footer, print_header};
+use vireon_sdk::{ClientBuilder, ClientIdentity, DeliveryPolicy, StreamSpec, TlsVerify};
 
 /// How long to publish before checking delivery.
 const PHASE_DURATION: Duration = Duration::from_secs(2);
@@ -42,8 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── generate CA + server + client certs ─────────────────────────
     let dir = std::env::temp_dir().join(format!("vireon-mtls-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
-    let (ca_pem, server_pem, server_key, client_pem, client_key) =
-        generate_mtls_certs(&dir)?;
+    let (ca_pem, server_pem, server_key, client_pem, client_key) = generate_mtls_certs(&dir)?;
 
     let port = ephemeral_port()?;
     let addr = format!("127.0.0.1:{port}");
@@ -62,8 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_header("Scenario 10 — Mutual TLS (mTLS)", PHASE_DURATION, &addr);
     println!("  CA:     {}", ca_pem.display());
-    println!("  Server: {} / {}", server_pem.display(), server_key.display());
-    println!("  Client: {} / {}", client_pem.display(), client_key.display());
+    println!(
+        "  Server: {} / {}",
+        server_pem.display(),
+        server_key.display()
+    );
+    println!(
+        "  Client: {} / {}",
+        client_pem.display(),
+        client_key.display()
+    );
     println!();
 
     // ── Phase 1: valid mTLS client connects + publishes ─────────────
@@ -80,9 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("mTLS connect should succeed with valid client cert");
 
     let stream = sub
-        .open_stream(
-            StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("mtls.test"),
-        )
+        .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic("mtls.test"))
         .await
         .expect("open_stream");
 
@@ -228,24 +231,26 @@ async fn publish_burst(client: &vireon_sdk::Client, topic: &str, deadline: Insta
 fn generate_mtls_certs(
     dir: &std::path::Path,
 ) -> std::io::Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
-    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+    use rcgen::{
+        CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    };
 
     // ── CA: self-signed, allowed to sign other certs ───────────────
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())
-        .expect("ca params");
-    ca_params.distinguished_name.push(DnType::CommonName, "vireon-bench-ca");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "vireon-bench-ca");
     ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_key = KeyPair::generate().expect("ca key");
     let ca_cert = ca_params.self_signed(&ca_key).expect("ca self-signed");
 
     // ── Server cert: signed by CA, SAN=localhost, EKU=ServerAuth ───
     let mut server_params =
         CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
-    server_params.distinguished_name.push(DnType::CommonName, "vireon-bench-server");
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "vireon-bench-server");
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_key = KeyPair::generate().expect("server key");
     let server_cert = server_params
@@ -253,9 +258,10 @@ fn generate_mtls_certs(
         .expect("server signed by CA");
 
     // ── Client cert: signed by CA, EKU=ClientAuth ──────────────────
-    let mut client_params =
-        CertificateParams::new(Vec::<String>::new()).expect("client params");
-    client_params.distinguished_name.push(DnType::CommonName, "vireon-bench-client");
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, "vireon-bench-client");
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let client_key = KeyPair::generate().expect("client key");
     let client_cert = client_params

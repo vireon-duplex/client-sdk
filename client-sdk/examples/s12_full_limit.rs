@@ -32,8 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
-    Histogram,
+    Histogram, connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
 };
 use vireon_sdk::{DeliveryPolicy, Qos, StreamHandle, StreamSpec};
 
@@ -165,7 +164,11 @@ async fn section_policies(addr: &str, frames: u64) -> Result<(), Box<dyn std::er
             .open_stream(StreamSpec::new(*policy).with_topic(topic))
             .await
             .expect("open pub stream");
-        println!("  opened {name:<20} sub_id={} pub_id={}", s.stream_id(), p.stream_id());
+        println!(
+            "  opened {name:<20} sub_id={} pub_id={}",
+            s.stream_id(),
+            p.stream_id()
+        );
         sub_streams.push((name, s));
         pub_streams.push(p);
     }
@@ -197,13 +200,20 @@ async fn section_policies(addr: &str, frames: u64) -> Result<(), Box<dyn std::er
     sub.close().await.ok();
 
     println!();
-    println!("  {:<22} {:>8}  {:>10}  {:>10}  {:>10}", "policy", "recv", "p50", "p99", "max");
+    println!(
+        "  {:<22} {:>8}  {:>10}  {:>10}  {:>10}",
+        "policy", "recv", "p50", "p99", "max"
+    );
     println!("  {}", "-".repeat(64));
     for c in collectors {
         let (name, h) = c.await.expect("collector panic");
         // LatestOnly intentionally collapses a burst to the newest frame
         // still queued at dequeue time — the low count is correct, not loss.
-        let note = if name == "LatestOnly" { "  (intentional: queue collapses to newest)" } else { "" };
+        let note = if name == "LatestOnly" {
+            "  (intentional: queue collapses to newest)"
+        } else {
+            ""
+        };
         println!(
             "  {:<22} {:>8}  {:>10}  {:>10}  {:>10}{note}",
             name,
@@ -243,15 +253,11 @@ async fn section_size_sweep(addr: &str, frames: u64) -> Result<(), Box<dyn std::
         let pub_c = connect_ready(addr).await;
         let topic = format!("size.{label}");
         let s = sub
-            .open_stream(
-                StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(topic.clone()),
-            )
+            .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(topic.clone()))
             .await
             .expect("open sub");
         let p = pub_c
-            .open_stream(
-                StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(topic),
-            )
+            .open_stream(StreamSpec::new(DeliveryPolicy::ReliableOrdered).with_topic(topic))
             .await
             .expect("open pub");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -303,7 +309,11 @@ async fn section_size_sweep(addr: &str, frames: u64) -> Result<(), Box<dyn std::
 // Section 3 — Fan-out (1 publisher → N subscribers)
 // ════════════════════════════════════════════════════════════════════
 
-async fn section_fanout(addr: &str, frames: u64, fanout_n: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn section_fanout(
+    addr: &str,
+    frames: u64,
+    fanout_n: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("─── Section 3: fan-out (1 publisher → {fanout_n} subscribers) ────");
     let publisher = connect_ready(addr).await;
 
@@ -312,10 +322,7 @@ async fn section_fanout(addr: &str, frames: u64, fanout_n: usize) -> Result<(), 
     let mut subs = Vec::with_capacity(fanout_n);
     for i in 0..fanout_n {
         let s = connect_ready(addr).await;
-        let mut sub = s
-            .subscribe("fanout.*")
-            .await
-            .expect("subscribe");
+        let mut sub = s.subscribe("fanout.*").await.expect("subscribe");
         subs.push(tokio::spawn(async move {
             let mut count = 0u64;
             // Bound the wait so we don't hang if a delivery is lost.
@@ -372,7 +379,10 @@ async fn section_fanout(addr: &str, frames: u64, fanout_n: usize) -> Result<(), 
 
 async fn section_qos(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("─── Section 4: QoS levels (AtMostOnce vs AtLeastOnce) ────");
-    let qos_list = [(Qos::AtMostOnce, "AtMostOnce"), (Qos::AtLeastOnce, "AtLeastOnce")];
+    let qos_list = [
+        (Qos::AtMostOnce, "AtMostOnce"),
+        (Qos::AtLeastOnce, "AtLeastOnce"),
+    ];
 
     println!();
     println!("  {:<14} {:>8}  {:>8}", "qos", "sent", "recv");
@@ -390,7 +400,10 @@ async fn section_qos(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         for i in 0..n {
-            pub_c.publish(&topic, format!("q-{i}").as_bytes()).await.expect("publish");
+            pub_c
+                .publish(&topic, format!("q-{i}").as_bytes())
+                .await
+                .expect("publish");
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
         pub_c.close().await.ok();
@@ -410,7 +423,10 @@ async fn section_qos(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 // Section 5 — Fire-and-forget throughput (try_publish)
 // ════════════════════════════════════════════════════════════════════
 
-async fn section_try_publish_throughput(addr: &str, frames: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn section_try_publish_throughput(
+    addr: &str,
+    frames: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("─── Section 5: fire-and-forget throughput (try_publish, 1 KiB) ────");
 
     let sub_client = connect_ready(addr).await;
@@ -466,13 +482,17 @@ async fn section_try_publish_throughput(addr: &str, frames: u64) -> Result<(), B
     sub_client.close().await.ok();
 
     println!();
-    println!("  accepted by try_publish: {accepted}/{total_target} in {:.3}s", pub_elapsed.as_secs_f64());
+    println!(
+        "  accepted by try_publish: {accepted}/{total_target} in {:.3}s",
+        pub_elapsed.as_secs_f64()
+    );
     let rate_per_sec = (accepted as f64) / pub_elapsed.as_secs_f64();
     let mib_s = rate_per_sec * 1024.0 / (1024.0 * 1024.0);
+    println!("  publish rate:            {rate_per_sec:.0} frames/s  ({mib_s:.1} MiB/s)",);
     println!(
-        "  publish rate:            {rate_per_sec:.0} frames/s  ({mib_s:.1} MiB/s)",
+        "  subscriber drained:      {got} frames in {:.2}s",
+        total_elapsed.as_secs_f64()
     );
-    println!("  subscriber drained:      {got} frames in {:.2}s", total_elapsed.as_secs_f64());
     println!();
     Ok(())
 }
@@ -507,11 +527,7 @@ async fn collect(mut stream: StreamHandle) -> LatStats {
     hist.into()
 }
 
-async fn collect_with_throughput(
-    mut stream: StreamHandle,
-    expected: u64,
-    size: usize,
-) -> LatStats {
+async fn collect_with_throughput(mut stream: StreamHandle, expected: u64, size: usize) -> LatStats {
     let mut hist = Histogram::default();
     let mut count = 0u64;
     // Quiet period scales with payload size: a 1 MiB frame can take
@@ -544,8 +560,14 @@ async fn collect_with_throughput(
 fn record_latency(msg: &vireon_sdk::Message, hist: &mut Histogram) {
     if msg.payload.len() >= 8 {
         let ts = u64::from_be_bytes([
-            msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-            msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+            msg.payload[0],
+            msg.payload[1],
+            msg.payload[2],
+            msg.payload[3],
+            msg.payload[4],
+            msg.payload[5],
+            msg.payload[6],
+            msg.payload[7],
         ]);
         let now = nanos();
         if now >= ts {
