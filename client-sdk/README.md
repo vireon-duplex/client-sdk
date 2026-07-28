@@ -302,9 +302,20 @@ out-of-order: 0
 
 | Scenario | Run | Proves |
 |----------|-----|--------|
-| **s15** Consumer group | `cargo run -p vireon-sdk --release --example s15_consumer_group` | 4 consumers join a group, 100 publishes are distributed round-robin — no duplicates, balanced counts |
+| **s15** Consumer group | `cargo run -p vireon-sdk --release --example s15_consumer_group` | 4 consumers join a group, 100 publishes are distributed round-robin — no duplicates, balanced counts. **Single-worker only** — see known limitation below |
 | **s16** Cluster replication | `cargo run -p vireon-sdk --release --example s16_cluster_replication` | 3-node cluster on loopback; subscriber on node 1 receives publishes sent to node 2 — proves cross-node routing + replication wiring |
 | **s17** Multi-core modes | `cargo run -p vireon-sdk --release --example s17_multicore_modes` | Same workload run twice — single-worker vs multi-worker — verifies SDK correctness in both modes and compares throughput |
+
+#### Known limitation: s15 in multi-worker mode
+
+`group_locals` (the per-(topic,group) member registry that drives
+round-robin delivery) lives on the per-worker `ApplicationLayer`, not
+in a shared table. In `--mode multi` the cross-worker
+`InterWorkerPublish` fan-out causes each worker that has any group
+member to deliver the publish independently, producing N×delivery.
+Cross-worker `group_locals` synchronization is an open server-side
+task; until then s15 must be exercised against a single-worker server
+(single or single-cluster matrix variants only).
 
 #### s16 — Cluster replication & cross-node routing
 

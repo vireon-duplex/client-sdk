@@ -24,6 +24,17 @@
 //!   balance:    member c0=25 c1=25 c2=25 c3=25
 //!   ✓ GROUP LOAD-BALANCING VERIFIED
 //! ```
+//!
+//! ## Known limitation: multi-worker mode
+//!
+//! This scenario is **only valid in single-worker mode**. The server's
+//! `group_locals` registry lives on the per-worker `ApplicationLayer`,
+//! so in `--mode multi` each worker independently round-robins to its
+//! own local members when an `InterWorkerPublish` fan-out reaches it,
+//! producing N×delivery (where N is the number of workers with at least
+//! one group member). Cross-worker group_locals synchronization is an
+//! open server-side task; until then the matrix runner skips s15 in
+//! multi/multi-cluster variants.
 
 #![allow(clippy::print_stdout)]
 
