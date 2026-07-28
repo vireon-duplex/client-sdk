@@ -85,5 +85,13 @@ path = "examples/s14_pool_multiplex.rs"
 name = "s15_consumer_group"
 path = "examples/s15_consumer_group.rs"
 
+[[example]]
+name = "s16_cluster_replication"
+path = "examples/s16_cluster_replication.rs"
+
+[[example]]
+name = "s17_multicore_modes"
+path = "examples/s17_multicore_modes.rs"
+
 [lints]
 workspace = true
