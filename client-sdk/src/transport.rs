@@ -204,7 +204,10 @@ impl Transport {
                         if n == 0 {
                             break;
                         }
-                        let dec = self.decoders.entry(sid).or_default();
+                        let dec = self
+                            .decoders
+                            .entry(sid)
+                            .or_insert_with(|| FrameDecoder::new().skip_crc(true));
                         dec.push(&self.recv_buf[..n]);
                         // Drain every complete frame the decoder now holds.
                         loop {
