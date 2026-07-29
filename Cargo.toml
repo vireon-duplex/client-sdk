@@ -93,5 +93,9 @@ path = "examples/s16_cluster_replication.rs"
 name = "s17_multicore_modes"
 path = "examples/s17_multicore_modes.rs"
 
+[[example]]
+name = "s18_cross_node_fanout"
+path = "examples/s18_cross_node_fanout.rs"
+
 [lints]
 workspace = true
