@@ -88,6 +88,19 @@ pub struct ServerGuard {
 }
 
 impl ServerGuard {
+    /// Returns `false` if the child process has already exited.
+    ///
+    /// Used after `start_with` + a brief sleep to detect servers that
+    /// failed to bind (ghost socket on the port → process exits
+    /// immediately).
+    pub fn is_alive(&mut self) -> bool {
+        if let Some(child) = &mut self.child {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    }
+
     /// Spawn with optional `--echo` / `--wal-root` flags. Piped stdout/stderr
     /// to keep test output clean.
     pub fn start(port: u16, cert: &Path, key: &Path) -> std::io::Result<Self> {
