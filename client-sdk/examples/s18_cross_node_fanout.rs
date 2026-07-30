@@ -35,8 +35,11 @@ use bench_common::{
 use vireon_sdk::Subscription;
 
 /// Number of publishes to fan out across the cluster.
-const PUBLISHES: u64 = 200;
+const PUBLISHES: u64 = 2000;
 const TOPIC: &str = "cluster.fanout";
+/// Payload size per frame (bytes).  First 8 bytes carry the sequence
+/// ID for gap/duplicate detection; the rest is filler.
+const PAYLOAD_LEN: usize = 8_192;
 /// Wait for Subscribe frames to propagate to all nodes via the
 /// inter-node UDP mesh before publishing.
 const SUB_PROPAGATION: Duration = Duration::from_millis(500);
@@ -67,54 +70,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Topology: 3 nodes on loopback ───────────────────────────────
     let (cert, key) = write_dev_cert().expect("cert");
-    let q1 = ephemeral_port().expect("quic port 1");
-    let q2 = ephemeral_port().expect("quic port 2");
-    let q3 = ephemeral_port().expect("quic port 3");
-    let c1 = ephemeral_port().expect("cluster udp 1");
-    let c2 = ephemeral_port().expect("cluster udp 2");
-    let c3 = ephemeral_port().expect("cluster udp 3");
-    let peers = format!("1=127.0.0.1:{c1},2=127.0.0.1:{c2},3=127.0.0.1:{c3}");
 
     print_header(
         "Scenario 18 — Cross-node Fan-out (all nodes receive)",
         Duration::from_secs(0),
-        &format!("node1=127.0.0.1:{q1}  node2=127.0.0.1:{q2}  node3=127.0.0.1:{q3}"),
+        "(ports assigned below)",
     );
     println!("  nodes:          3");
     println!("  mode:           {mode} (workers={workers})");
     println!("  replication:    {replication}");
     println!("  publishes:      {PUBLISHES}");
+    println!("  payload:        {PAYLOAD_LEN} B/frame");
     println!("  topic:          {TOPIC}");
     println!("  subscribers:    3 (one per node)");
     println!();
 
-    // ── Build extra CLI args per node ───────────────────────────────
-    let mut common: Vec<&str> = vec![
-        "--cluster-peers",
-        Box::leak(peers.clone().into_boxed_str()),
-        "--cluster-replication-factor",
-        Box::leak(replication.to_string().into_boxed_str()),
-        "--workers",
-        Box::leak(workers.to_string().into_boxed_str()),
-    ];
-    if mode == "multi" {
-        common.push("--mode");
-        common.push("multi");
+    // ── Spawn 3-node cluster with retry ────────────────────────────
+    // Ghost UDP sockets from prior tests (kernel 6.8 io_uring RECV)
+    // can cause a node to fail binding its port. We detect this by
+    // checking process liveness after a brief startup window and
+    // retry with fresh ports if any node died.
+    const MAX_START_RETRIES: u32 = 4;
+    let mut g1: Option<ServerGuard> = None;
+    let mut g2: Option<ServerGuard> = None;
+    let mut g3: Option<ServerGuard> = None;
+    let mut q1: u16 = 0;
+    let mut q2: u16 = 0;
+    let mut q3: u16 = 0;
+
+    for attempt in 0..MAX_START_RETRIES {
+        // Pick fresh ports each attempt to avoid ghost-socket conflicts.
+        q1 = ephemeral_port().expect("quic port 1");
+        q2 = ephemeral_port().expect("quic port 2");
+        q3 = ephemeral_port().expect("quic port 3");
+        let c1 = ephemeral_port().expect("cluster udp 1");
+        let c2 = ephemeral_port().expect("cluster udp 2");
+        let c3 = ephemeral_port().expect("cluster udp 3");
+        let peers = format!("1=127.0.0.1:{c1},2=127.0.0.1:{c2},3=127.0.0.1:{c3}");
+
+        let mut common: Vec<&str> = vec![
+            "--cluster-peers",
+            Box::leak(peers.clone().into_boxed_str()),
+            "--cluster-replication-factor",
+            Box::leak(replication.to_string().into_boxed_str()),
+            "--workers",
+            Box::leak(workers.to_string().into_boxed_str()),
+        ];
+        if mode == "multi" {
+            common.push("--mode");
+            common.push("multi");
+        }
+
+        let node_id_flag = "--cluster-node-id";
+        let mut node_args: Vec<Vec<&str>> = Vec::new();
+        for n in 1u32..=3 {
+            let mut v: Vec<&str> = vec![node_id_flag, Box::leak(n.to_string().into_boxed_str())];
+            v.extend(common.iter().copied());
+            node_args.push(v);
+        }
+
+        let mut ng1 =
+            ServerGuard::start_with(q1, &cert, &key, &node_args[0]).expect("spawn node 1");
+        let mut ng2 =
+            ServerGuard::start_with(q2, &cert, &key, &node_args[1]).expect("spawn node 2");
+        let mut ng3 =
+            ServerGuard::start_with(q3, &cert, &key, &node_args[2]).expect("spawn node 3");
+
+        // Wait for servers to bind (or detect early exit from ghost sockets).
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let alive = ng1.is_alive() && ng2.is_alive() && ng3.is_alive();
+        if alive {
+            // Extra warmup for cluster mesh formation.
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            println!(
+                "[cluster] all 3 nodes started (attempt {}) — node1=127.0.0.1:{q1}  node2=127.0.0.1:{q2}  node3=127.0.0.1:{q3}",
+                attempt + 1
+            );
+            g1 = Some(ng1);
+            g2 = Some(ng2);
+            g3 = Some(ng3);
+            break;
+        }
+
+        // At least one died — kill all and retry with fresh ports.
+        eprintln!(
+            "[cluster] attempt {}: a node exited early (likely ghost-socket bind failure), retrying...",
+            attempt + 1
+        );
+        drop(ng1);
+        drop(ng2);
+        drop(ng3);
+
+        if attempt + 1 < MAX_START_RETRIES {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
 
-    let node_id_flag = "--cluster-node-id";
-    let mut node_args: Vec<Vec<&str>> = Vec::new();
-    for n in 1u32..=3 {
-        let mut v: Vec<&str> = vec![node_id_flag, Box::leak(n.to_string().into_boxed_str())];
-        v.extend(common.iter().copied());
-        node_args.push(v);
-    }
-
-    // ── Spawn 3 server processes ────────────────────────────────────
-    let g1 = ServerGuard::start_with(q1, &cert, &key, &node_args[0]).expect("spawn node 1");
-    let g2 = ServerGuard::start_with(q2, &cert, &key, &node_args[1]).expect("spawn node 2");
-    let g3 = ServerGuard::start_with(q3, &cert, &key, &node_args[2]).expect("spawn node 3");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut g1 = g1.expect("cluster node 1 failed to start after retries");
+    let mut g2 = g2.expect("cluster node 2 failed to start after retries");
+    let mut g3 = g3.expect("cluster node 3 failed to start after retries");
 
     // ── Subscribers on all 3 nodes ──────────────────────────────────
     let sub1_client = connect_ready(&format!("127.0.0.1:{q1}")).await;
@@ -134,19 +189,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[publisher] connected to node 1");
 
     let start = std::time::Instant::now();
+    let mut buf = vec![0u8; PAYLOAD_LEN];
     for n in 0u64..PUBLISHES {
-        let payload = n.to_be_bytes();
+        buf[..8].copy_from_slice(&n.to_be_bytes());
+        // Fill remainder with a pattern for debugging.
+        if PAYLOAD_LEN > 8 {
+            let pattern = (n as u8).wrapping_mul(0x5B);
+            for b in &mut buf[8..] {
+                *b = pattern;
+            }
+        }
         pub_client
-            .publish(TOPIC, &payload)
+            .publish(TOPIC, &buf[..])
             .await
             .expect("publish");
     }
-    println!("[publisher] published {PUBLISHES} frames in {:?}", start.elapsed());
+    let pub_elapsed = start.elapsed();
+    let pub_fps = PUBLISHES as f64 / pub_elapsed.as_secs_f64();
+    let pub_mibs =
+        (PUBLISHES as usize * PAYLOAD_LEN) as f64 / pub_elapsed.as_secs_f64() / (1024.0 * 1024.0);
+    println!(
+        "[publisher] published {PUBLISHES} frames in {pub_elapsed:?} — {pub_fps:.0} frames/s ({pub_mibs:.1} MiB/s)"
+    );
 
-    // ── Drain + verify each subscriber ──────────────────────────────
-    let (d1, g1c, dup1) = drain_verify(&mut sub1, "node 1").await;
-    let (d2, g2c, dup2) = drain_verify(&mut sub2, "node 2").await;
-    let (d3, g3c, dup3) = drain_verify(&mut sub3, "node 3").await;
+    // ── Drain + verify each subscriber (concurrently for timing) ────
+    let drain_start = std::time::Instant::now();
+    let ((d1, g1c, dup1), (d2, g2c, dup2), (d3, g3c, dup3)) = tokio::join!(
+        drain_verify(&mut sub1, "node 1"),
+        drain_verify(&mut sub2, "node 2"),
+        drain_verify(&mut sub3, "node 3"),
+    );
+    let delivery_elapsed = drain_start.elapsed();
+    let total_delivered = d1 + d2 + d3;
+    let del_fps = total_delivered as f64 / delivery_elapsed.as_secs_f64();
+    let del_mibs = (total_delivered as usize * PAYLOAD_LEN) as f64
+        / delivery_elapsed.as_secs_f64()
+        / (1024.0 * 1024.0);
+    println!(
+        "[delivery]   {total_delivered} frames in {delivery_elapsed:?} — {del_fps:.0} frames/s ({del_mibs:.1} MiB/s aggregate across 3 nodes)"
+    );
 
     println!();
     println!("  node 1:  delivered {d1}  gaps {g1c}  dup {dup1}");
@@ -185,6 +266,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Drain a subscriber and return `(delivered, gaps, duplicates)`.
+/// Exits early once `PUBLISHES` unique messages have been received
+/// (avoids inflating delivery time with unnecessary drain-wait).
 async fn drain_verify(
     sub: &mut Subscription,
     _label: &str,
@@ -202,8 +285,13 @@ async fn drain_verify(
                     let id = u64::from_be_bytes(b);
                     if ids.contains(&id) {
                         dups += 1;
+                    } else {
+                        ids.push(id);
                     }
-                    ids.push(id);
+                }
+                // Early-exit once we've received everything expected.
+                if ids.len() as u64 >= PUBLISHES {
+                    break;
                 }
             }
             _ => break,
