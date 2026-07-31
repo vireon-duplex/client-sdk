@@ -41,9 +41,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) struct Transport {
     conn: Connection,
     sock: UdpSocket,
-    #[allow(dead_code)]
     peer: SocketAddr,
-    #[allow(dead_code)]
     local: SocketAddr,
     send_buf: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -72,6 +70,15 @@ impl Transport {
     ///
     /// On success the connection is established and ALPN-negotiated.
     pub(crate) async fn connect(cfg: &ClientConfig) -> Result<Self, ConnectError> {
+        Self::connect_with_session(cfg, None).await
+    }
+
+    /// Like [`connect`](Self::connect) but offers a previously stored
+    /// session ticket for abbreviated handshake (0-RTT resumption).
+    pub(crate) async fn connect_with_session(
+        cfg: &ClientConfig,
+        session: Option<&[u8]>,
+    ) -> Result<Self, ConnectError> {
         let peer: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
             .map_err(|e| ConnectError::Config(format!("invalid server address: {e}")))?;
@@ -90,7 +97,13 @@ impl Transport {
         let mut qcfg =
             build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
         let scid = quiche::ConnectionId::from_vec(gen_scid());
-        let conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
+        let mut conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
+
+        // Offer a previously stored session ticket for 0-RTT resumption.
+        // Must be called before any packets are sent.
+        if let Some(ticket) = session {
+            let _ = conn.set_session(ticket);
+        }
 
         let mut t = Self {
             conn,
@@ -370,6 +383,7 @@ impl Transport {
     /// The connection task updates this on every stream_send / flush_pending;
     /// publishers read it to detect QUIC flow-control backpressure before
     /// the cmd channel fills.
+    #[allow(dead_code)]
     pub(crate) fn pending_shared(&self) -> Arc<AtomicUsize> {
         self.pending_shared.clone()
     }
@@ -477,10 +491,69 @@ impl Transport {
         self.conn.is_closed()
     }
 
+    /// Trigger QUIC connection migration by rebinding the UDP socket to a
+    /// new local address.
+    ///
+    /// The quiche `Connection` is **not** recreated — it retains the same
+    /// DCID, so the server recognises subsequent packets as belonging to the
+    /// existing connection. The server validates the new path with
+    /// PATH_CHALLENGE/PATH_RESPONSE automatically (migration is enabled
+    /// server-side via `ExtensionFlags.migration`).
+    ///
+    /// On success:
+    /// - `self.sock` is replaced with a fresh socket bound to `bind_addr`
+    ///   (use `"0.0.0.0:0"` for a new ephemeral port).
+    /// - `self.local` reflects the new local address.
+    /// - A probe packet is flushed immediately so the server begins path
+    ///   validation without waiting for the next publish.
+    ///
+    /// Typical triggers: WiFi → cellular handoff, VPN connect/disconnect,
+    /// or any scenario where the local IP changes but the session should
+    /// survive.
+    pub(crate) fn rebind(&mut self, bind_addr: &str) -> Result<(), ConnectError> {
+        // Use std::net for synchronous bind+connect, then hand off to tokio.
+        // Both are fast syscalls (no handshake for UDP); this keeps the
+        // method callable from the sync handle_cmd path.
+        let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+        std_sock.set_nonblocking(true)?;
+        std_sock.connect(self.peer)?;
+
+        let new_sock = UdpSocket::from_std(std_sock)?;
+        let new_local = new_sock.local_addr()?;
+
+        self.sock = new_sock;
+        self.local = new_local;
+
+        // Flush any pending quiche output so the server sees traffic from
+        // the new 4-tuple immediately and starts path validation.
+        self.flush()?;
+
+        tracing::info!(
+            local = %new_local,
+            peer = %self.peer,
+            "[transport] connection migrated — UDP socket rebound"
+        );
+        Ok(())
+    }
+
     /// Close the connection gracefully with a peer-app error code.
     pub(crate) fn close(&mut self) {
         let _ = self.conn.close(true, 0x00, b"bye");
         let _ = self.flush();
+    }
+
+    /// Extract the session ticket (if available) for use in 0-RTT
+    /// resumption on a future reconnect. Returns `None` until the
+    /// server has sent NEW_SESSION_TICKET (typically after the
+    /// handshake completes).
+    pub(crate) fn session_ticket(&self) -> Option<Vec<u8>> {
+        self.conn.session().map(|s| s.to_vec())
+    }
+
+    /// `true` if this connection was established via session resumption
+    /// (abbreviated handshake) rather than a full TLS handshake.
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.conn.is_resumed()
     }
 
     /// Build a [`ConnectError`] describing why the connection closed.
@@ -541,7 +614,9 @@ fn build_quiche_config(
     config.set_initial_max_stream_data_uni(10 * 1024 * 1024);
     config.set_initial_max_streams_bidi(1024);
     config.set_initial_max_streams_uni(1024);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(false);
+    // Enable session resumption (0-RTT early data on reconnect).
+    config.enable_early_data();
     config.discover_pmtu(false);
     config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
 

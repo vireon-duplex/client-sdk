@@ -97,5 +97,9 @@ path = "examples/s17_multicore_modes.rs"
 name = "s18_cross_node_fanout"
 path = "examples/s18_cross_node_fanout.rs"
 
+[[example]]
+name = "s19_connection_migration"
+path = "examples/s19_connection_migration.rs"
+
 [lints]
 workspace = true
