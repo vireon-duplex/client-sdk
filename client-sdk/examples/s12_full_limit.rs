@@ -455,7 +455,7 @@ async fn section_try_publish_throughput(
                             c.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
-                        Err(_) => tokio::task::yield_now().await,
+                        Err(_) => tokio::time::sleep(Duration::from_micros(100)).await,
                     }
                 }
             }
@@ -613,7 +613,7 @@ async fn publish_burst(stream: StreamHandle, topic: String, frames: u64, size: u
             }
             match stream.try_publish(&topic, buf.as_slice()) {
                 Ok(()) => break,
-                Err(_) => tokio::task::yield_now().await,
+                Err(_) => tokio::time::sleep(Duration::from_micros(100)).await,
             }
         }
     }

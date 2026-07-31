@@ -24,7 +24,7 @@
 //!
 //! ```text
 //! S14_POOL=4         Pool size (default 4)
-//! S14_FRAMES=20000   Total frames to publish (default 20 000)
+//! S14_FRAMES=5000    Total frames to publish (default 5 000)
 //! S14_FRAME_SIZE=2048  Bytes per frame (default 2 KiB)
 //! ```
 //!
@@ -57,7 +57,7 @@ fn total_frames() -> u64 {
     std::env::var("S14_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(20_000)
+        .unwrap_or(5_000)
 }
 
 fn frame_size() -> usize {
@@ -139,22 +139,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Publish round-robin via the pool. try_publish fails over across
     // members so a single saturated member doesn't stall the producer.
+    //
+    // Backpressure: when the pool's pending-write queue exceeds the
+    // threshold OR all cmd channels are full, we sleep briefly instead
+    // of yield_now(). Under heavy load yield_now() barely yields to the
+    // background I/O task — a 100 µs sleep gives it real CPU time to
+    // drain command channels and flush quiche's send buffer.
     let publish_start = Instant::now();
     for _ in 0..total {
         loop {
-            // Byte-based backpressure: yield when the pool's pending queue
-            // is large. This keeps the in-flight gap small enough that
-            // the subscriber can drain within a reasonable time.
             let pending = pool.pending_bytes() as u64;
-            if pending > 32 * 1024 * 1024 {
-                tokio::task::yield_now().await;
+            if pending > 8 * 1024 * 1024 {
+                tokio::time::sleep(Duration::from_micros(100)).await;
                 continue;
             }
             if pool.try_publish(topic, payload.as_slice()).is_ok() {
                 break;
             }
-            // All members' cmd channels full — yield and retry.
-            tokio::task::yield_now().await;
+            // All members' cmd channels full — sleep and retry.
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
         sent.fetch_add(1, Ordering::Relaxed);
     }
