@@ -30,9 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::DeliveryPolicy;
 use crate::config::ClientConfig;
-use crate::error::{ConnectError, PublishError, RpcError, StreamError, SubscribeError};
+use crate::error::{ConnectError, GroupError, PublishError, RpcError, StreamError, SubscribeError};
 use crate::message::Message;
-use crate::pubsub::Subscription;
+use crate::pubsub::{GroupSubscription, Subscription};
 use crate::stream::{StreamHandle, StreamSpec};
 use crate::transport::Transport;
 
@@ -120,6 +120,24 @@ pub(crate) enum ConnCmd {
     /// Sent by `Client::rpc` when the caller's timeout elapses or the
     /// receiver is dropped. Removes the entry from `pending_rpcs`.
     CancelRpc { cid: u128 },
+    /// Join a consumer group on `topic`. Opens a dedicated QUIC stream,
+    /// sends `ConsumerGroupJoin`, and starts a periodic re-join heartbeat
+    /// (the server evicts members silent for >3 s).
+    GroupJoin {
+        topic: String,
+        group: String,
+        consumer: String,
+        partitions: u32,
+        resp: oneshot::Sender<Result<GroupSubscription, GroupError>>,
+    },
+    /// Leave a consumer group. Sends `ConsumerGroupLeave` on the stream
+    /// that originally sent the Join, and tears down local routing.
+    GroupLeave {
+        topic: String,
+        group: String,
+        consumer: String,
+        resp: oneshot::Sender<Result<(), GroupError>>,
+    },
     /// Close the connection.
     Close {
         resp: oneshot::Sender<Result<(), ConnectError>>,
@@ -412,6 +430,86 @@ impl Client {
         resp_rx.await.map_err(|_| StreamError::NotConnected)?
     }
 
+    /// Join a consumer group on `topic` as `consumer` and return a handle
+    /// that yields round-robin-balanced publishes.
+    ///
+    /// Internally opens a dedicated QUIC stream, sends `ConsumerGroupJoin`,
+    /// and re-sends it every second as a heartbeat (the server evicts
+    /// members silent for >3 s). The returned [`GroupSubscription`]
+    /// delivers only the publishes the server assigns to this consumer —
+    /// other group members receive the rest.
+    ///
+    /// Uses the default partition count (1). Pass a custom value via
+    /// [`Client::subscribe_group_with_partitions`] if the assignment
+    /// strategy consumes it.
+    ///
+    /// # Errors
+    /// [`GroupError::NotConnected`] if the connection is gone.
+    pub async fn subscribe_group(
+        &self,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+    ) -> Result<GroupSubscription, GroupError> {
+        self.subscribe_group_with_partitions(topic, group, consumer, 1)
+            .await
+    }
+
+    /// Like [`Client::subscribe_group`] but lets the caller specify the
+    /// `partitions` hint. Must be ≥1 — the server rejects zero.
+    ///
+    /// [`Client::subscribe_group`]: Self::subscribe_group
+    pub async fn subscribe_group_with_partitions(
+        &self,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+        partitions: u32,
+    ) -> Result<GroupSubscription, GroupError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::GroupJoin {
+            topic: topic.to_string(),
+            group: group.to_string(),
+            consumer: consumer.to_string(),
+            partitions: partitions.max(1),
+            resp: resp_tx,
+        };
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| GroupError::NotConnected)?;
+        resp_rx.await.map_err(|_| GroupError::NotConnected)?
+    }
+
+    /// Leave a consumer group previously joined via [`Client::subscribe_group`].
+    ///
+    /// Stops the heartbeat, sends `ConsumerGroupLeave` to the server, and
+    /// tears down the dedicated stream. The corresponding
+    /// [`GroupSubscription`] will return `None` from `recv()` once any
+    /// in-flight messages are drained.
+    ///
+    /// # Errors
+    /// [`GroupError::NotConnected`] if the connection is gone.
+    pub async fn leave_group(
+        &self,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+    ) -> Result<(), GroupError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::GroupLeave {
+            topic: topic.to_string(),
+            group: group.to_string(),
+            consumer: consumer.to_string(),
+            resp: resp_tx,
+        };
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| GroupError::NotConnected)?;
+        resp_rx.await.map_err(|_| GroupError::NotConnected)?
+    }
+
     /// Close the connection and stop the background task.
     ///
     /// # Errors
@@ -484,6 +582,21 @@ struct TaskState {
     /// replies — peek the first 16 payload bytes for a matching cid
     /// before normal fan-out."
     rpc_reply_topics: HashSet<String>,
+    /// Active consumer-group memberships. Each entry's `sid` is also
+    /// present in `streams` so inbound publishes route to the group
+    /// subscription's channel via the dedicated-stream dispatch path
+    /// (no pattern matching → no cross-contamination with default-channel
+    /// subscribers on the same topic).
+    group_subs: Vec<GroupSubEntry>,
+}
+
+/// One consumer-group membership, retained for heartbeat + reconnect replay.
+struct GroupSubEntry {
+    sid: u64,
+    topic: String,
+    group: String,
+    consumer: String,
+    partitions: u32,
 }
 
 /// Log drop counters every Nth drop. Chosen so a brief overload
@@ -525,6 +638,7 @@ impl TaskState {
             stream_drops: 0,
             pending_rpcs: HashMap::new(),
             rpc_reply_topics: HashSet::new(),
+            group_subs: Vec::new(),
         }
     }
 
@@ -719,6 +833,27 @@ impl TaskState {
                 self.pending_rpcs.remove(&cid);
                 false
             }
+            ConnCmd::GroupJoin {
+                topic,
+                group,
+                consumer,
+                partitions,
+                resp,
+            } => {
+                let out = self.handle_group_join(&topic, &group, &consumer, partitions, transport);
+                let _ = resp.send(out);
+                false
+            }
+            ConnCmd::GroupLeave {
+                topic,
+                group,
+                consumer,
+                resp,
+            } => {
+                let out = self.handle_group_leave(&topic, &group, &consumer, transport);
+                let _ = resp.send(out);
+                false
+            }
             ConnCmd::Close { resp } => {
                 // Store the response — the main loop sends it after the
                 // graceful drain completes. This ensures Client::close()
@@ -830,6 +965,135 @@ impl TaskState {
         ))
     }
 
+    /// Open a dedicated stream, send `ConsumerGroupJoin`, and register the
+    /// membership for periodic heartbeats. The server records
+    /// `(conn_idx, quic_stream_id=sid)` in its `group_locals` table and
+    /// routes one round-robin publish per inbound message to this stream.
+    fn handle_group_join(
+        &mut self,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+        partitions: u32,
+        transport: &mut Transport,
+    ) -> Result<GroupSubscription, GroupError> {
+        let sid = self.next_bidi;
+        self.next_bidi = self
+            .next_bidi
+            .checked_add(4)
+            .ok_or(GroupError::Rejected("no stream capacity".into()))?;
+
+        let (tx, rx) = mpsc::channel(self.subscriber_buffer);
+        // Reuse the dedicated-stream routing entry: dispatch will find `sid`
+        // here and route inbound publishes straight to the channel — no
+        // pattern matching, so default-channel subscribers on the same topic
+        // never see group-balanced messages (and vice versa).
+        self.streams.insert(
+            sid,
+            StreamEntry {
+                policy: DeliveryPolicy::ReliableOrdered,
+                topic: Some(topic.to_string()),
+                tx,
+            },
+        );
+
+        // Declare the stream + a normal Subscribe on the topic. Without
+        // StreamOpen, the server's `application.rs:handle_stream_open`
+        // never assigns a policy and the stream is unknown to the
+        // per-connection bookkeeping that gates `route_publish` fan-out.
+        // Without Subscribe, the server has no `Subscriber` entry in
+        // `pubsub_registry` — `route_publish` finds zero local targets
+        // and the publish is dropped before reaching `group_locals`.
+        let policy_bytes = StreamOpenMeta::new(DeliveryPolicy::ReliableOrdered).encode();
+        let so_header = FrameHeader::new(StreamId::new(sid), MessageType::StreamOpen)
+            .with_seq(self.next_seq(sid));
+        self.encode_and_send_raw(so_header, &policy_bytes, sid, transport)
+            .map_err(|_| GroupError::NotConnected)?;
+
+        let join_buf = encode_group_join(topic, group, consumer, partitions);
+        let join_header = FrameHeader::new(StreamId::new(sid), MessageType::ConsumerGroupJoin)
+            .with_seq(self.next_seq(sid));
+        self.encode_and_send_raw(join_header, &join_buf, sid, transport)
+            .map_err(|_| GroupError::NotConnected)?;
+        transport.flush().map_err(|_| GroupError::NotConnected)?;
+
+        self.group_subs.push(GroupSubEntry {
+            sid,
+            topic: topic.to_string(),
+            group: group.to_string(),
+            consumer: consumer.to_string(),
+            partitions,
+        });
+
+        Ok(GroupSubscription::new(rx))
+    }
+
+    /// Send `ConsumerGroupLeave` for the matching membership and drop local
+    /// routing. In-flight messages already buffered in the channel are
+    /// preserved until the [`GroupSubscription`] is dropped by the caller.
+    fn handle_group_leave(
+        &mut self,
+        topic: &str,
+        group: &str,
+        consumer: &str,
+        transport: &mut Transport,
+    ) -> Result<(), GroupError> {
+        let Some(idx) = self
+            .group_subs
+            .iter()
+            .position(|e| e.topic == topic && e.group == group && e.consumer == consumer)
+        else {
+            // Already left (or never joined) — treat as success so callers
+            // can issue leave unconditionally on shutdown without tracking
+            // join state themselves.
+            return Ok(());
+        };
+        let entry = self.group_subs.swap_remove(idx);
+        let buf = encode_group_leave(topic, group, consumer);
+        let header = FrameHeader::new(
+            StreamId::new(entry.sid),
+            MessageType::ConsumerGroupLeave,
+        )
+        .with_seq(self.next_seq(entry.sid));
+        let _ = self.encode_and_send_raw(header, &buf, entry.sid, transport);
+        let _ = transport.flush();
+        // Drop the dispatch entry; inbound publishes for `sid` will be
+        // logged-and-skipped by the dispatch path.
+        self.streams.remove(&entry.sid);
+        Ok(())
+    }
+
+    /// Re-send every active group Join (the server evicts members silent
+    /// for >3 s; re-sending on the heartbeat tick keeps membership alive
+    /// without relying on a separate timer per group). The server dedups
+    /// by `consumer_id` so this never creates phantom members.
+    fn heartbeat_group_subs(&mut self, transport: &mut Transport) {
+        // Snapshot sids+payloads so we can build+send without borrowing
+        // `self.group_subs` and `self.seqs` simultaneously.
+        let snap: Vec<(u64, Vec<u8>)> = self
+            .group_subs
+            .iter()
+            .map(|e| {
+                (
+                    e.sid,
+                    encode_group_join(&e.topic, &e.group, &e.consumer, e.partitions),
+                )
+            })
+            .collect();
+        for (sid, buf) in snap {
+            let header = FrameHeader::new(StreamId::new(sid), MessageType::ConsumerGroupJoin)
+                .with_seq(self.next_seq(sid));
+            if let Err(e) = transport.send_frame(header, &buf, sid) {
+                tracing::warn!(
+                    stream_id = sid,
+                    error = %e,
+                    "[client] group heartbeat: send failed"
+                );
+                return;
+            }
+        }
+    }
+
     /// Re-send every active subscription and re-open every dedicated stream
     /// on a freshly-established transport. Called by [`run`] after a successful
     /// reconnect so the server repopulates its subscriber registry + policy
@@ -892,6 +1156,33 @@ impl TaskState {
                     stream_id = sid,
                     error = %e,
                     "[client] replay: subscribe send failed"
+                );
+                return;
+            }
+        }
+
+        // Consumer-group memberships: re-send Join on each group sub's
+        // dedicated stream. Re-establishes server-side `group_locals`
+        // entries that were lost when the old connection tore down.
+        // Snapshot first so `self.next_seq` can mutably borrow without
+        // conflicting with the `&self.group_subs` iteration.
+        let group_replay: Vec<(u64, String, String, String, u32)> = self
+            .group_subs
+            .iter()
+            .map(|e| (e.sid, e.topic.clone(), e.group.clone(), e.consumer.clone(), e.partitions))
+            .collect();
+        for (sid, topic, group, consumer, partitions) in &group_replay {
+            let buf = encode_group_join(topic, group, consumer, *partitions);
+            let h = FrameHeader::new(
+                StreamId::new(*sid),
+                MessageType::ConsumerGroupJoin,
+            )
+            .with_seq(self.next_seq(*sid));
+            if let Err(e) = transport.send_frame(h, &buf, *sid) {
+                tracing::warn!(
+                    stream_id = sid,
+                    error = %e,
+                    "[client] replay: group join send failed"
                 );
                 return;
             }
@@ -1032,6 +1323,9 @@ pub(crate) async fn run(
                 if let Err(e) = transport.send_frame(header, &buf, DEFAULT_STREAM) {
                     tracing::warn!(error = %e, "[client] heartbeat send failed");
                 }
+                // Consumer-group heartbeats: re-send each Join so the server
+                // does not evict us (eviction window = 3 s, tick = 1 s).
+                state.heartbeat_group_subs(&mut transport);
             }
             cmd = rx.recv() => {
                 match cmd {
@@ -1199,6 +1493,12 @@ fn fail_cmd_not_connected(cmd: ConnCmd) {
         ConnCmd::CancelRpc { .. } => {
             // Nothing to ack — CancelRpc is fire-and-forget cleanup.
         }
+        ConnCmd::GroupJoin { resp, .. } => {
+            let _ = resp.send(Err(GroupError::NotConnected));
+        }
+        ConnCmd::GroupLeave { resp, .. } => {
+            let _ = resp.send(Err(GroupError::NotConnected));
+        }
         ConnCmd::Close { resp } => {
             let _ = resp.send(Err(ConnectError::Closed(
                 "close requested during reconnect backoff".into(),
@@ -1235,6 +1535,45 @@ fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(topic.as_bytes());
     buf.extend_from_slice(payload);
+    buf
+}
+
+/// `topic_len(u16) + topic + group_len(u16) + group +
+///    consumer_len(u16) + consumer + partitions(u32)`
+///
+/// Matches `ApplicationLayer::parse_group_prefix` +
+/// `handle_group_join` exactly. The server reads `partitions` from the
+/// trailing 4 bytes after the consumer id.
+fn encode_group_join(topic: &str, group: &str, consumer: &str, partitions: u32) -> Vec<u8> {
+    let tl = u16::try_from(topic.len()).unwrap_or(u16::MAX);
+    let gl = u16::try_from(group.len()).unwrap_or(u16::MAX);
+    let cl = u16::try_from(consumer.len()).unwrap_or(u16::MAX);
+    let mut buf = Vec::with_capacity(
+        2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4,
+    );
+    buf.extend_from_slice(&tl.to_be_bytes());
+    buf.extend_from_slice(topic.as_bytes());
+    buf.extend_from_slice(&gl.to_be_bytes());
+    buf.extend_from_slice(group.as_bytes());
+    buf.extend_from_slice(&cl.to_be_bytes());
+    buf.extend_from_slice(consumer.as_bytes());
+    buf.extend_from_slice(&partitions.to_be_bytes());
+    buf
+}
+
+/// `topic_len(u16) + topic + group_len(u16) + group +
+///    consumer_len(u16) + consumer`
+fn encode_group_leave(topic: &str, group: &str, consumer: &str) -> Vec<u8> {
+    let tl = u16::try_from(topic.len()).unwrap_or(u16::MAX);
+    let gl = u16::try_from(group.len()).unwrap_or(u16::MAX);
+    let cl = u16::try_from(consumer.len()).unwrap_or(u16::MAX);
+    let mut buf = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len());
+    buf.extend_from_slice(&tl.to_be_bytes());
+    buf.extend_from_slice(topic.as_bytes());
+    buf.extend_from_slice(&gl.to_be_bytes());
+    buf.extend_from_slice(group.as_bytes());
+    buf.extend_from_slice(&cl.to_be_bytes());
+    buf.extend_from_slice(consumer.as_bytes());
     buf
 }
 
@@ -1293,6 +1632,48 @@ mod tests {
     fn publish_encode_layout() {
         let b = encode_publish("t", &[1, 2, 3]);
         assert_eq!(b, &[0, 1, b't', 1, 2, 3]);
+    }
+
+    #[test]
+    fn group_join_encode_layout() {
+        // topic="t", group="g", consumer="c", partitions=1
+        let b = encode_group_join("t", "g", "c", 1);
+        // Expected: 0,1,'t' | 0,1,'g' | 0,1,'c' | 0,0,0,1
+        assert_eq!(
+            b,
+            &[0, 1, b't', 0, 1, b'g', 0, 1, b'c', 0, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn group_leave_encode_layout() {
+        let b = encode_group_leave("t", "g", "c");
+        assert_eq!(b, &[0, 1, b't', 0, 1, b'g', 0, 1, b'c']);
+    }
+
+    #[test]
+    fn group_join_matches_server_parse_prefix() {
+        // Round-trip: the bytes we produce must be acceptable to the
+        // server's `parse_group_prefix` shape — i.e. the first three
+        // length-prefixed strings decode cleanly and leave a 4-byte tail.
+        let b = encode_group_join("sensor.temp", "workers", "c1", 8);
+        // topic
+        let tlen = u16::from_be_bytes([b[0], b[1]]) as usize;
+        assert_eq!(&b[2..2 + tlen], b"sensor.temp");
+        // group
+        let mut pos = 2 + tlen;
+        let glen = u16::from_be_bytes([b[pos], b[pos + 1]]) as usize;
+        pos += 2;
+        assert_eq!(&b[pos..pos + glen], b"workers");
+        // consumer
+        pos += glen;
+        let clen = u16::from_be_bytes([b[pos], b[pos + 1]]) as usize;
+        pos += 2;
+        assert_eq!(&b[pos..pos + clen], b"c1");
+        // partitions tail
+        pos += clen;
+        assert_eq!(b.len() - pos, 4);
+        assert_eq!(u32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]), 8);
     }
 
     #[test]

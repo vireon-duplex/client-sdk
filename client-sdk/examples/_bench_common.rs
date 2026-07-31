@@ -88,13 +88,35 @@ pub struct ServerGuard {
 }
 
 impl ServerGuard {
+    /// Returns `false` if the child process has already exited.
+    ///
+    /// Used after `start_with` + a brief sleep to detect servers that
+    /// failed to bind (ghost socket on the port → process exits
+    /// immediately).
+    pub fn is_alive(&mut self) -> bool {
+        if let Some(child) = &mut self.child {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    }
+
     /// Spawn with optional `--echo` / `--wal-root` flags. Piped stdout/stderr
     /// to keep test output clean.
     pub fn start(port: u16, cert: &Path, key: &Path) -> std::io::Result<Self> {
-        Self::start_with(port, cert, key, &[])
+        // Default to a single worker — matches the historical behavior
+        // every existing example relies on. Callers wanting a different
+        // worker count / mode should use [`ServerGuard::start_with`] and
+        // pass `--workers` / `--mode` explicitly.
+        Self::start_with(port, cert, key, &["--workers", "1"])
     }
 
     /// Spawn with extra CLI args (e.g. `["--echo"]` or `["--wal-root", "/tmp/wal"]`).
+    ///
+    /// NOTE: this variant does NOT add `--workers` automatically — callers
+    /// must pass `--workers N` themselves if they want a specific count.
+    /// This avoids clap's "cannot be used multiple times" error when a
+    /// caller wants to override the worker count.
     pub fn start_with(
         port: u16,
         cert: &Path,
@@ -108,8 +130,6 @@ impl ServerGuard {
             &port.to_string(),
             "--bind",
             "127.0.0.1",
-            "--workers",
-            "1",
             "--cert",
             cert.to_str().expect("cert path utf8"),
             "--key",

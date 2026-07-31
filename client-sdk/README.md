@@ -298,6 +298,69 @@ out-of-order: 0
 ✓ SEQUENCE INTEGRITY VERIFIED
 ```
 
+### Cluster & multi-core scenarios
+
+| Scenario | Run | Proves |
+|----------|-----|--------|
+| **s15** Consumer group | `cargo run -p vireon-sdk --release --example s15_consumer_group` | 4 consumers join a group, 100 publishes are distributed round-robin — no duplicates, balanced counts. **Single-worker only** — see known limitation below |
+| **s16** Cluster replication | `cargo run -p vireon-sdk --release --example s16_cluster_replication` | 3-node cluster on loopback; subscriber on node 1 receives publishes sent to node 2 — proves cross-node routing + replication wiring |
+| **s17** Multi-core modes | `cargo run -p vireon-sdk --release --example s17_multicore_modes` | Same workload run twice — single-worker vs multi-worker — verifies SDK correctness in both modes and compares throughput |
+
+#### Known limitation: s15 in multi-worker mode
+
+`group_locals` (the per-(topic,group) member registry that drives
+round-robin delivery) lives on the per-worker `ApplicationLayer`, not
+in a shared table. In `--mode multi` the cross-worker
+`InterWorkerPublish` fan-out causes each worker that has any group
+member to deliver the publish independently, producing N×delivery.
+Cross-worker `group_locals` synchronization is an open server-side
+task; until then s15 must be exercised against a single-worker server
+(single or single-cluster matrix variants only).
+
+#### s16 — Cluster replication & cross-node routing
+
+Spawns three `quic-server` processes forming a cluster via
+`--cluster-peers`. Each node filters the shared peer string to find its
+own UDP bind addr. A subscriber connects to **node 1**, a publisher to
+**node 2**; consistent hashing decides topic ownership and the cluster
+mesh routes the publish to whichever node owns it, then back to the
+subscriber.
+
+```text
+VIREON_CLUSTER_MODE=multi VIREON_CLUSTER_WORKERS=2 \
+  cargo run -p vireon-sdk --release --example s16_cluster_replication
+```
+
+Env vars (all optional):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `VIREON_CLUSTER_MODE` | `single` | `single` or `multi` worker mode for each node |
+| `VIREON_CLUSTER_WORKERS` | `1` | Worker threads per node (used only when `MODE=multi`) |
+| `VIREON_CLUSTER_REPLICATION` | `2` | `--cluster-replication-factor` — `1`=no replicas, `2`=one replica copy, `3`=all nodes hold a copy |
+
+#### s17 — Multi-core mode comparison
+
+Runs the same 500-publish / 1 KiB-payload workload twice: once against
+a single-worker server, once against a multi-worker server. Reports
+correctness + throughput for each. Acts as a regression check that the
+SDK behaves correctly when the server runs in multi-core mode
+(cross-worker fan-out mesh, `InterWorkerPublish` broadcast, per-core
+socket options are all dark under single-worker).
+
+```text
+VIREON_MULTICORE_WORKERS=4 \
+  cargo run -p vireon-sdk --release --example s17_multicore_modes
+```
+
+Env vars (all optional):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `VIREON_MULTICORE_WORKERS` | `min(num_cpus, 8)` | Worker count for the multi-core trial |
+| `VIREON_MULTICORE_SKIP_SINGLE` | unset | Skip the single-worker baseline |
+| `VIREON_MULTICORE_SKIP_MULTI` | unset | Skip the multi-worker trial |
+
 ## Tests
 
 The integration suite spawns a real `quic-server` binary on an ephemeral
