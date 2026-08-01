@@ -38,6 +38,7 @@
 //! [`quiche::Connection`]: quiche::Connection
 
 #![warn(missing_docs)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
 pub mod connection;

@@ -37,13 +37,18 @@ const DGRAM_BUF: usize = 65507;
 /// Handshake must complete within this deadline.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Threshold for the "eager" encode path (MPI-inspired). Frames whose
+/// wire size fits in this stack buffer avoid all heap interaction — no
+/// `BytesMut::clear`, no `reserve`, no `advance_mut`. The vast majority
+/// of pub/sub control frames (Subscribe, Ack, small Publishes) are well
+/// under this threshold.
+const STACK_ENCODE_MAX: usize = 2048;
+
 /// The transport-layer state owned by the connection task.
 pub(crate) struct Transport {
     conn: Connection,
     sock: UdpSocket,
-    #[allow(dead_code)]
     peer: SocketAddr,
-    #[allow(dead_code)]
     local: SocketAddr,
     send_buf: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -64,6 +69,9 @@ pub(crate) struct Transport {
     /// commands queue up), this reflects real-time QUIC flow-control
     /// pressure from the subscriber side.
     pending_shared: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reusable encode buffer for `send_frame`. Avoids a `BytesMut::with_capacity`
+    /// allocation per frame — cleared and re-filled each call.
+    encode_buf: BytesMut,
 }
 
 impl Transport {
@@ -72,6 +80,15 @@ impl Transport {
     ///
     /// On success the connection is established and ALPN-negotiated.
     pub(crate) async fn connect(cfg: &ClientConfig) -> Result<Self, ConnectError> {
+        Self::connect_with_session(cfg, None).await
+    }
+
+    /// Like [`connect`](Self::connect) but offers a previously stored
+    /// session ticket for abbreviated handshake (0-RTT resumption).
+    pub(crate) async fn connect_with_session(
+        cfg: &ClientConfig,
+        session: Option<&[u8]>,
+    ) -> Result<Self, ConnectError> {
         let peer: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
             .map_err(|e| ConnectError::Config(format!("invalid server address: {e}")))?;
@@ -90,7 +107,13 @@ impl Transport {
         let mut qcfg =
             build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
         let scid = quiche::ConnectionId::from_vec(gen_scid());
-        let conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
+        let mut conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
+
+        // Offer a previously stored session ticket for 0-RTT resumption.
+        // Must be called before any packets are sent.
+        if let Some(ticket) = session {
+            let _ = conn.set_session(ticket);
+        }
 
         let mut t = Self {
             conn,
@@ -102,6 +125,7 @@ impl Transport {
             decoders: HashMap::new(),
             pending: HashMap::new(),
             pending_shared: Arc::new(AtomicUsize::new(0)),
+            encode_buf: BytesMut::new(),
         };
 
         t.handshake().await?;
@@ -253,12 +277,34 @@ impl Transport {
         payload: &[u8],
         stream_id: u64,
     ) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::with_capacity(
-            frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE,
-        );
-        frame::codec::encode_into(&mut buf, header, payload)
+        let wire_size = frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE;
+
+        if wire_size <= STACK_ENCODE_MAX {
+            // Eager path (MPI-inspired): stack-allocated encode buffer.
+            // Zero heap interaction for small frames — the majority of
+            // pub/sub control messages (Subscribe, Ack, heartbeat, small
+            // Publishes) fit here, avoiding BytesMut overhead entirely.
+            let mut stack_buf = [0u8; STACK_ENCODE_MAX];
+            let written = frame::codec::encode_into_slice(
+                &mut stack_buf[..wire_size],
+                header,
+                payload,
+            )
             .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
-        self.stream_send(stream_id, &buf)
+            return self.stream_send(stream_id, &stack_buf[..written]);
+        }
+
+        // Rendezvous path: heap buffer for large payloads (> 2 KiB).
+        // encode_buf is reused across calls — clear + reserve is zero-alloc
+        // after warmup (capacity grows once to the largest frame and stays).
+        self.encode_buf.clear();
+        self.encode_buf.reserve(wire_size);
+        frame::codec::encode_into(&mut self.encode_buf, header, payload)
+            .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
+        let encoded = std::mem::take(&mut self.encode_buf);
+        let result = self.stream_send(stream_id, &encoded);
+        self.encode_buf = encoded;
+        result
     }
 
     /// Send raw bytes on a QUIC stream (opens it implicitly on first write).
@@ -370,6 +416,7 @@ impl Transport {
     /// The connection task updates this on every stream_send / flush_pending;
     /// publishers read it to detect QUIC flow-control backpressure before
     /// the cmd channel fills.
+    #[allow(dead_code)]
     pub(crate) fn pending_shared(&self) -> Arc<AtomicUsize> {
         self.pending_shared.clone()
     }
@@ -477,10 +524,69 @@ impl Transport {
         self.conn.is_closed()
     }
 
+    /// Trigger QUIC connection migration by rebinding the UDP socket to a
+    /// new local address.
+    ///
+    /// The quiche `Connection` is **not** recreated — it retains the same
+    /// DCID, so the server recognises subsequent packets as belonging to the
+    /// existing connection. The server validates the new path with
+    /// PATH_CHALLENGE/PATH_RESPONSE automatically (migration is enabled
+    /// server-side via `ExtensionFlags.migration`).
+    ///
+    /// On success:
+    /// - `self.sock` is replaced with a fresh socket bound to `bind_addr`
+    ///   (use `"0.0.0.0:0"` for a new ephemeral port).
+    /// - `self.local` reflects the new local address.
+    /// - A probe packet is flushed immediately so the server begins path
+    ///   validation without waiting for the next publish.
+    ///
+    /// Typical triggers: WiFi → cellular handoff, VPN connect/disconnect,
+    /// or any scenario where the local IP changes but the session should
+    /// survive.
+    pub(crate) fn rebind(&mut self, bind_addr: &str) -> Result<(), ConnectError> {
+        // Use std::net for synchronous bind+connect, then hand off to tokio.
+        // Both are fast syscalls (no handshake for UDP); this keeps the
+        // method callable from the sync handle_cmd path.
+        let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+        std_sock.set_nonblocking(true)?;
+        std_sock.connect(self.peer)?;
+
+        let new_sock = UdpSocket::from_std(std_sock)?;
+        let new_local = new_sock.local_addr()?;
+
+        self.sock = new_sock;
+        self.local = new_local;
+
+        // Flush any pending quiche output so the server sees traffic from
+        // the new 4-tuple immediately and starts path validation.
+        self.flush()?;
+
+        tracing::info!(
+            local = %new_local,
+            peer = %self.peer,
+            "[transport] connection migrated — UDP socket rebound"
+        );
+        Ok(())
+    }
+
     /// Close the connection gracefully with a peer-app error code.
     pub(crate) fn close(&mut self) {
         let _ = self.conn.close(true, 0x00, b"bye");
         let _ = self.flush();
+    }
+
+    /// Extract the session ticket (if available) for use in 0-RTT
+    /// resumption on a future reconnect. Returns `None` until the
+    /// server has sent NEW_SESSION_TICKET (typically after the
+    /// handshake completes).
+    pub(crate) fn session_ticket(&self) -> Option<Vec<u8>> {
+        self.conn.session().map(|s| s.to_vec())
+    }
+
+    /// `true` if this connection was established via session resumption
+    /// (abbreviated handshake) rather than a full TLS handshake.
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.conn.is_resumed()
     }
 
     /// Build a [`ConnectError`] describing why the connection closed.
@@ -541,7 +647,9 @@ fn build_quiche_config(
     config.set_initial_max_stream_data_uni(10 * 1024 * 1024);
     config.set_initial_max_streams_bidi(1024);
     config.set_initial_max_streams_uni(1024);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(false);
+    // Enable session resumption (0-RTT early data on reconnect).
+    config.enable_early_data();
     config.discover_pmtu(false);
     config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
 
