@@ -41,8 +41,12 @@ const TOPIC: &str = "cluster.fanout";
 /// ID for gap/duplicate detection; the rest is filler.
 const PAYLOAD_LEN: usize = 8_192;
 /// Wait for Subscribe frames to propagate to all nodes via the
-/// inter-node UDP mesh before publishing.
-const SUB_PROPAGATION: Duration = Duration::from_millis(500);
+/// inter-node UDP mesh before publishing. Must be long enough for:
+///   1. Subscribe frame → server → local registry
+///   2. Server → InterNodeMessage::Subscribe → owner node (UDP)
+///   3. Owner node processes → RemoteSubscriberRegistry updated
+/// Under powersave CPU governor (~3x slower), this needs more time.
+const SUB_PROPAGATION: Duration = Duration::from_millis(1000);
 /// Drain window for subscribers to receive the tail of the burst.
 const DRAIN: Duration = Duration::from_secs(10);
 
@@ -141,8 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let alive = ng1.is_alive() && ng2.is_alive() && ng3.is_alive();
         if alive {
-            // Extra warmup for cluster mesh formation.
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            // Extra warmup for cluster mesh formation + first heartbeat.
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             println!(
                 "[cluster] all 3 nodes started (attempt {}) — node1=127.0.0.1:{q1}  node2=127.0.0.1:{q2}  node3=127.0.0.1:{q3}",
                 attempt + 1
