@@ -37,6 +37,13 @@ const DGRAM_BUF: usize = 65507;
 /// Handshake must complete within this deadline.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Threshold for the "eager" encode path (MPI-inspired). Frames whose
+/// wire size fits in this stack buffer avoid all heap interaction — no
+/// `BytesMut::clear`, no `reserve`, no `advance_mut`. The vast majority
+/// of pub/sub control frames (Subscribe, Ack, small Publishes) are well
+/// under this threshold.
+const STACK_ENCODE_MAX: usize = 2048;
+
 /// The transport-layer state owned by the connection task.
 pub(crate) struct Transport {
     conn: Connection,
@@ -62,6 +69,9 @@ pub(crate) struct Transport {
     /// commands queue up), this reflects real-time QUIC flow-control
     /// pressure from the subscriber side.
     pending_shared: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reusable encode buffer for `send_frame`. Avoids a `BytesMut::with_capacity`
+    /// allocation per frame — cleared and re-filled each call.
+    encode_buf: BytesMut,
 }
 
 impl Transport {
@@ -115,6 +125,7 @@ impl Transport {
             decoders: HashMap::new(),
             pending: HashMap::new(),
             pending_shared: Arc::new(AtomicUsize::new(0)),
+            encode_buf: BytesMut::new(),
         };
 
         t.handshake().await?;
@@ -266,12 +277,34 @@ impl Transport {
         payload: &[u8],
         stream_id: u64,
     ) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::with_capacity(
-            frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE,
-        );
-        frame::codec::encode_into(&mut buf, header, payload)
+        let wire_size = frame::codec::HEADER_SIZE + payload.len() + frame::codec::CRC_SIZE;
+
+        if wire_size <= STACK_ENCODE_MAX {
+            // Eager path (MPI-inspired): stack-allocated encode buffer.
+            // Zero heap interaction for small frames — the majority of
+            // pub/sub control messages (Subscribe, Ack, heartbeat, small
+            // Publishes) fit here, avoiding BytesMut overhead entirely.
+            let mut stack_buf = [0u8; STACK_ENCODE_MAX];
+            let written = frame::codec::encode_into_slice(
+                &mut stack_buf[..wire_size],
+                header,
+                payload,
+            )
             .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
-        self.stream_send(stream_id, &buf)
+            return self.stream_send(stream_id, &stack_buf[..written]);
+        }
+
+        // Rendezvous path: heap buffer for large payloads (> 2 KiB).
+        // encode_buf is reused across calls — clear + reserve is zero-alloc
+        // after warmup (capacity grows once to the largest frame and stays).
+        self.encode_buf.clear();
+        self.encode_buf.reserve(wire_size);
+        frame::codec::encode_into(&mut self.encode_buf, header, payload)
+            .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
+        let encoded = std::mem::take(&mut self.encode_buf);
+        let result = self.stream_send(stream_id, &encoded);
+        self.encode_buf = encoded;
+        result
     }
 
     /// Send raw bytes on a QUIC stream (opens it implicitly on first write).
