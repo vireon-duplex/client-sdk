@@ -161,16 +161,30 @@ pub struct Client {
     /// publishers via [`Self::pending_bytes`] to detect QUIC flow-control
     /// backpressure from the subscriber before the cmd channel fills.
     pending_shared: Arc<std::sync::atomic::AtomicUsize>,
+    /// Mirror of NotifyOffset frames received (LogTail diagnostics).
+    notify_offset_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Mirror of FetchReply frames received (LogTail diagnostics).
+    fetch_reply_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Client {
     /// Construct the public handle. Called by [`crate::ClientBuilder::connect`].
+    /// The `notify_offset_count` / `fetch_reply_count` Arcs are shared with
+    /// the background task so the handle reads live values without any
+    /// cross-task communication.
     #[must_use]
     pub(crate) fn new(
         tx: mpsc::Sender<ConnCmd>,
         pending_shared: Arc<std::sync::atomic::AtomicUsize>,
+        notify_offset_count: Arc<std::sync::atomic::AtomicU64>,
+        fetch_reply_count: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        Self { tx, pending_shared }
+        Self {
+            tx,
+            pending_shared,
+            notify_offset_count,
+            fetch_reply_count,
+        }
     }
 
     /// Total bytes buffered in `Transport::pending` awaiting a QUIC
@@ -185,6 +199,23 @@ impl Client {
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
         self.pending_shared
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of NotifyOffset frames received from the server (LogTail
+    /// delivery path). Non-zero proves the server used LogTail, not
+    /// BatchPush, for at least some publishes.
+    #[must_use]
+    pub fn notify_offset_count(&self) -> u64 {
+        self.notify_offset_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of FetchReply frames received (LogTail pull responses).
+    /// Should equal `notify_offset_count` in steady state.
+    #[must_use]
+    pub fn fetch_reply_count(&self) -> u64 {
+        self.fetch_reply_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -628,6 +659,12 @@ struct TaskState {
     /// Drained by the poll loop after `process_readable` and sent via
     /// `transport.send_frame`.
     pending_fetches: Vec<(bytes::Bytes, u64, u64)>,
+    /// Shared mirror of NotifyOffset frames received (LogTail diagnostics).
+    /// The same `Arc` is held by [`Client`], so `Client::notify_offset_count`
+    /// reads this value without cross-task communication.
+    notify_offset_count: Arc<AtomicU64>,
+    /// Shared mirror of FetchReply frames received (LogTail diagnostics).
+    fetch_reply_count: Arc<AtomicU64>,
 }
 
 /// One consumer-group membership, retained for heartbeat + reconnect replay.
@@ -663,6 +700,8 @@ impl TaskState {
         max_message_size: usize,
         cmd_tx: mpsc::Sender<ConnCmd>,
         pending_shared: Arc<AtomicUsize>,
+        notify_offset_count: Arc<AtomicU64>,
+        fetch_reply_count: Arc<AtomicU64>,
     ) -> Self {
         Self {
             subs: Vec::new(),
@@ -680,6 +719,8 @@ impl TaskState {
             rpc_reply_topics: HashSet::new(),
             group_subs: Vec::new(),
             pending_fetches: Vec::new(),
+            notify_offset_count,
+            fetch_reply_count,
         }
     }
 
@@ -731,6 +772,7 @@ impl TaskState {
                         .unwrap_or([0u8; 8]),
                 );
                 self.pending_fetches.push((topic_bytes, offset, sid));
+                self.notify_offset_count.fetch_add(1, Ordering::Relaxed);
             }
             MessageType::FetchReply => {
                 // LogTail pull response: `topic_len:u16 + topic + offset:u64
@@ -761,6 +803,7 @@ impl TaskState {
                 }
                 let body = payload.slice(body_start..body_end);
                 self.fanout_message(sid, topic_bytes, body, frame.seq.get());
+                self.fetch_reply_count.fetch_add(1, Ordering::Relaxed);
             }
             _ => {
                 // Subscribe/Unsubscribe acks and other control frames are not
@@ -1349,6 +1392,8 @@ pub(crate) async fn run(
     mut rx: mpsc::Receiver<ConnCmd>,
     cmd_tx: mpsc::Sender<ConnCmd>,
     pending_shared: Arc<AtomicUsize>,
+    notify_offset_count: Arc<AtomicU64>,
+    fetch_reply_count: Arc<AtomicU64>,
     ready: oneshot::Sender<Result<(), ConnectError>>,
 ) {
     let mut transport = match Transport::connect(&cfg).await {
@@ -1376,6 +1421,8 @@ pub(crate) async fn run(
         cfg.max_message_size,
         cmd_tx,
         pending_shared.clone(),
+        notify_offset_count.clone(),
+        fetch_reply_count.clone(),
     );
 
     // Dead-peer detection: quiche 0.22 has no built-in keepalive and ICMP
@@ -1899,7 +1946,9 @@ mod tests {
     fn make_state() -> TaskState {
         let (tx, _rx) = mpsc::channel(8);
         let pending = Arc::new(AtomicUsize::new(0));
-        TaskState::new(8, 1024 * 1024, tx, pending)
+        let notify = Arc::new(AtomicU64::new(0));
+        let fetch = Arc::new(AtomicU64::new(0));
+        TaskState::new(8, 1024 * 1024, tx, pending, notify, fetch)
     }
 
     fn make_publish_frame(topic: &str, body: &[u8]) -> frame::codec::Frame {
