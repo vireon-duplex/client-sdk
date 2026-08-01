@@ -142,6 +142,11 @@ pub(crate) enum ConnCmd {
     Close {
         resp: oneshot::Sender<Result<(), ConnectError>>,
     },
+    /// Trigger QUIC connection migration by rebinding the UDP socket.
+    Migrate {
+        bind_addr: String,
+        resp: oneshot::Sender<Result<(), ConnectError>>,
+    },
 }
 
 /// A cloneable handle to a Vireon connection.
@@ -525,6 +530,36 @@ impl Client {
             .await
             .map_err(|_| ConnectError::Closed("connection task exited".into()))?
     }
+
+    /// Trigger QUIC connection migration by rebinding the UDP socket.
+    ///
+    /// The underlying QUIC connection (DCID, crypto state, stream state)
+    /// is preserved — only the local UDP 4-tuple changes. The server
+    /// validates the new path via PATH_CHALLENGE/PATH_RESPONSE and
+    /// redirects subsequent traffic automatically.
+    ///
+    /// Use `"0.0.0.0:0"` for `bind_addr` to let the OS pick a new
+    /// ephemeral port (simulates a NAT rebinding). To bind to a specific
+    /// interface (e.g. after WiFi → cellular handoff), pass that
+    /// interface's IP.
+    ///
+    /// # Errors
+    /// - [`ConnectError::Io`] if the new socket cannot be bound.
+    /// - [`ConnectError::Closed`] if the connection task has exited.
+    pub async fn migrate(&self, bind_addr: &str) -> Result<(), ConnectError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::Migrate {
+            bind_addr: bind_addr.to_owned(),
+            resp: resp_tx,
+        };
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| ConnectError::Closed("client already closed".into()))?;
+        resp_rx
+            .await
+            .map_err(|_| ConnectError::Closed("connection task exited".into()))?
+    }
 }
 
 /// Exponential backoff for the `attempt`-th retry (0-indexed):
@@ -860,6 +895,30 @@ impl TaskState {
                 // returns only after all pending writes are flushed.
                 self.close_resp = Some(resp);
                 true
+            }
+            ConnCmd::Migrate { bind_addr, resp } => {
+                let result = transport.rebind(&bind_addr);
+                if result.is_ok() {
+                    // Force a probe packet from the new 4-tuple so the
+                    // server sees traffic from the new source address and
+                    // starts PATH_CHALLENGE/PATH_RESPONSE validation.
+                    // Without this, the server doesn't know about the
+                    // migration until the next 1-second heartbeat — and
+                    // until then it sends replies to the old (now-dead)
+                    // socket.
+                    let buf = encode_subscribe("_migration.probe", 0);
+                    let header =
+                        FrameHeader::new(StreamId::new(DEFAULT_STREAM), MessageType::Subscribe)
+                            .with_seq(self.next_seq(DEFAULT_STREAM));
+                    if let Err(e) =
+                        self.encode_and_send_raw(header, &buf, DEFAULT_STREAM, transport)
+                    {
+                        tracing::warn!(error = %e, "[client] migration probe send failed");
+                    }
+                    let _ = transport.flush();
+                }
+                let _ = resp.send(result);
+                false
             }
         }
     }
@@ -1238,6 +1297,11 @@ pub(crate) async fn run(
         }
     };
 
+    // Session ticket for 0-RTT resumption on reconnect. Extracted after
+    // the handshake; quiche populates it once the server sends
+    // NEW_SESSION_TICKET (may arrive a few hundred ms after handshake).
+    let mut session_ticket: Option<Vec<u8>> = None;
+
     let mut state = TaskState::new(
         cfg.subscriber_buffer,
         cfg.max_message_size,
@@ -1279,6 +1343,17 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "[client] flush error");
         }
 
+        // 4b. Lazily capture the session ticket once the server sends it.
+        // quiche populates conn.session() asynchronously (after the
+        // NEW_SESSION_TICKET frame arrives, typically 100-500ms post-
+        // handshake). We check every iteration until it appears.
+        if session_ticket.is_none() {
+            if let Some(t) = transport.session_ticket() {
+                tracing::debug!("[client] session ticket received — 0-RTT resumption available");
+                session_ticket = Some(t);
+            }
+        }
+
         // 4. Dead-peer detection: if no data received for HEARTBEAT_TIMEOUT,
         //    the server is presumed dead. Force-close so is_closed() returns
         //    true and the reconnect FSM fires.
@@ -1292,7 +1367,7 @@ pub(crate) async fn run(
 
         // 5. Connection teardown? Try reconnect per the configured policy.
         if transport.is_closed() {
-            if let Some(new_t) = reconnect(&cfg, &mut rx).await {
+            if let Some(new_t) = reconnect(&cfg, &mut rx, session_ticket.as_deref()).await {
                 transport = new_t;
                 last_recv = Instant::now();
                 tracing::info!("[client] reconnected — replaying subscriptions");
@@ -1417,7 +1492,11 @@ pub(crate) async fn run(
 /// after all attempts are exhausted. While sleeping between attempts the
 /// task still selects on the command channel so that dropping every
 /// `Client` handle aborts reconnect quickly.
-async fn reconnect(cfg: &ClientConfig, rx: &mut mpsc::Receiver<ConnCmd>) -> Option<Transport> {
+async fn reconnect(
+    cfg: &ClientConfig,
+    rx: &mut mpsc::Receiver<ConnCmd>,
+    session: Option<&[u8]>,
+) -> Option<Transport> {
     let policy = &cfg.reconnect;
     if policy.max_attempts == 0 {
         return None;
@@ -1448,10 +1527,11 @@ async fn reconnect(cfg: &ClientConfig, rx: &mut mpsc::Receiver<ConnCmd>) -> Opti
             _ = tokio::time::sleep(backoff) => {}
         }
 
-        match Transport::connect(cfg).await {
+        match Transport::connect_with_session(cfg, session).await {
             Ok(t) => {
                 tracing::info!(
                     attempt = attempt + 1,
+                    resumed = t.is_resumed(),
                     "[client] reconnect: established new connection"
                 );
                 return Some(t);
@@ -1502,6 +1582,11 @@ fn fail_cmd_not_connected(cmd: ConnCmd) {
         ConnCmd::Close { resp } => {
             let _ = resp.send(Err(ConnectError::Closed(
                 "close requested during reconnect backoff".into(),
+            )));
+        }
+        ConnCmd::Migrate { resp, .. } => {
+            let _ = resp.send(Err(ConnectError::Closed(
+                "migrate requested during reconnect backoff".into(),
             )));
         }
     }
