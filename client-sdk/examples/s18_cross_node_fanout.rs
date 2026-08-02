@@ -43,10 +43,13 @@ const PAYLOAD_LEN: usize = 8_192;
 /// Wait for Subscribe frames to propagate to all nodes via the
 /// inter-node UDP mesh before publishing. Must be long enough for:
 ///   1. Subscribe frame → server → local registry
-///   2. Server → InterNodeMessage::Subscribe → owner node (UDP)
-///   3. Owner node processes → RemoteSubscriberRegistry updated
+///   2. Cluster hash ring to form (consistent-hash owner resolution)
+///   3. Server → InterNodeMessage::Subscribe → owner node (UDP)
+///   4. Owner node processes → RemoteSubscriberRegistry updated
 /// Under powersave CPU governor (~3x slower), this needs more time.
-const SUB_PROPAGATION: Duration = Duration::from_millis(1000);
+/// The server also re-broadcasts subscriptions on each heartbeat tick
+/// (1 s), so 2 s guarantees at least one re-broadcast fires.
+const SUB_PROPAGATION: Duration = Duration::from_millis(2000);
 /// Drain window for subscribers to receive the tail of the burst.
 const DRAIN: Duration = Duration::from_secs(10);
 

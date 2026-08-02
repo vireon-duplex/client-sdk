@@ -63,10 +63,9 @@ impl Default for TlsVerify {
 /// mTLS deployments typically combine
 /// [`TlsVerify::Strict`] with a [`ClientIdentity`].
 ///
-/// ```
-/// # use vireon_sdk::{ClientBuilder, ClientIdentity, TlsVerify};
-/// # fn demo() -> Result<(), vireon_sdk::ConnectError> {
-/// # async {
+/// ```no_run
+/// use vireon_sdk::{ClientBuilder, ClientIdentity, TlsVerify};
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let _ = ClientBuilder::new("127.0.0.1:4433")
 ///     .sni("localhost")
 ///     .tls_verify(TlsVerify::Strict { ca: "/etc/vireon/ca.pem".into() })
@@ -76,10 +75,7 @@ impl Default for TlsVerify {
 ///     })
 ///     .connect()
 ///     .await?;
-/// # Ok::<_, vireon_sdk::ConnectError>(())
-/// # });
-/// # Ok(())
-/// # }
+/// # Ok(()) }
 /// ```
 #[derive(Clone, Debug)]
 pub struct ClientIdentity {
@@ -158,7 +154,11 @@ pub(crate) struct ClientConfig {
     pub reconnect: ReconnectPolicy,
     /// Maximum accepted payload size for a single message (defensive cap).
     pub max_message_size: usize,
-    /// Depth of each subscriber's bounded channel.
+    /// Depth of each subscriber's bounded channel. When the channel is
+    /// full, incoming messages are dropped (the I/O task must not block).
+    /// Default 65 536 — large enough to absorb typical publish bursts.
+    /// Payloads are `Bytes` (Arc-cloned), so per-slot memory is ~56 B
+    /// struct + shared payload allocation.
     pub subscriber_buffer: usize,
     /// Depth of the command channel between [`Client`] handles and the
     /// background I/O task. Larger values absorb `try_publish` bursts;
@@ -175,7 +175,7 @@ pub(crate) struct ClientConfig {
 ///
 /// Construct with [`ClientBuilder::new`], chain setters, then [`connect`].
 /// Cloning the builder (e.g. for [`ClientPool::connect`](crate::ClientPool::connect))
-/// produces an identical builder — the wrapped [`ClientConfig`] is already
+/// produces an identical builder — the wrapped config is already
 /// `Clone`.
 ///
 /// [`connect`]: ClientBuilder::connect
@@ -204,7 +204,7 @@ impl ClientBuilder {
                 client_identity: None,
                 reconnect: ReconnectPolicy::default(),
                 max_message_size: 1024 * 1024,
-                subscriber_buffer: 8192,
+                subscriber_buffer: 65536,
                 cmd_channel_cap: 1024,
                 idle_timeout: Duration::from_secs(60),
             },
@@ -296,6 +296,8 @@ impl ClientBuilder {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let pending_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify_offset_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fetch_reply_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Clone the sender into the task so it can embed it in StreamHandles.
         // The spawned task is detached: it exits when the last Client handle
         // drops (closing the command channel) or a Close command is received.
@@ -304,10 +306,17 @@ impl ClientBuilder {
             rx,
             tx.clone(),
             pending_shared.clone(),
+            notify_offset_count.clone(),
+            fetch_reply_count.clone(),
             ready_tx,
         ));
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Client::new(tx, pending_shared)),
+            Ok(Ok(())) => Ok(Client::new(
+                tx,
+                pending_shared,
+                notify_offset_count,
+                fetch_reply_count,
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(ConnectError::Closed(
                 "connect task exited before the handshake completed".into(),
