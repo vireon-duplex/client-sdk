@@ -1,7 +1,6 @@
 //! Low-level QUIC transport: tokio UDP socket + `quiche::Connection`.
 //!
-//! This is the async port of the demo client's sync `ClientConn`
-//! (`quic-client/src/main.rs:112-282`). A [`Transport`] owns:
+//! The transport owns:
 //!
 //! * the `!Sync` [`quiche::Connection`] (must live on a single task),
 //! * a non-blocking [`tokio::net::UdpSocket`],
@@ -27,7 +26,7 @@ use crate::config::{ClientConfig, ClientIdentity, TlsVerify};
 use crate::error::ConnectError;
 
 /// ALPN protocol the client offers. The server advertises
-/// `["hq-interop","http/1.1","h3-29"]` (`transport-layer/quic-engine/src/crypto.rs:39`);
+/// `["hq-interop","http/1.1","h3-29"]`;
 /// `h3-29` is the common value both sides accept.
 const ALPN: &[u8] = b"h3-29";
 

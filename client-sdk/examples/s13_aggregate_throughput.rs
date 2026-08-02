@@ -36,7 +36,7 @@
 //! ## Run
 //!
 //! ```text
-//! # default: 2 × 4 × 8 KiB × 5s  (~380 MiB/s, 0% loss, ~11ms p50)
+//! # default: 2 × 4 × 8 KiB × 5s
 //! cargo run -p vireon-sdk --release --example s13_aggregate_throughput
 //!
 //! # sweep: find the sweet spot for your host
@@ -56,15 +56,6 @@
 //! publisher yields for 2 ms, letting subscribers catch up. This
 //! keeps the server's retry queue in its sweet spot and delivers
 //! **0% loss** for `ReliableOrdered` streams under sustained load.
-//!
-//! ## Findings (loopback, 4-worker server, max-throughput preset)
-//!
-//! | Config          | Delivery | Loss | p50    |
-//! |-----------------|----------|------|--------|
-//! | 2 × 4 × 8 KiB   | 386 MiB/s| 0.0% | 11 ms  |
-//! | 2 × 1 × 8 KiB   | 330 MiB/s| 0.0% | 80 ms  |
-//! | 4 × 1 × 8 KiB   | 345 MiB/s| 0.0% | 32 ms  |
-//! | 4 × 4 × 8 KiB   | 420 MiB/s| 0.0% | 64 ms  |
 
 #![allow(clippy::print_stdout)]
 
