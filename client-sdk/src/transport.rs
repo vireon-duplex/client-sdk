@@ -1,7 +1,7 @@
 //! Low-level QUIC transport: tokio UDP socket + `quiche::Connection`.
 //!
 //! This is the async port of the demo client's sync `ClientConn`
-//! (`quic-client/src/main.rs:112-282`). A [`Transport`] owns:
+//! (`quic-client/src/main.rs:112-282`). The transport owns:
 //!
 //! * the `!Sync` [`quiche::Connection`] (must live on a single task),
 //! * a non-blocking [`tokio::net::UdpSocket`],
