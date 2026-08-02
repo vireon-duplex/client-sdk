@@ -4,12 +4,11 @@
 //! dedicated QUIC streams**, each subscribed to a distinct topic. One
 //! publisher fires 5 distinct workloads on the default channel.
 //!
-//! The `video` stream generates the bulk of the data (~2 MiB/s of 16 KiB
-//! frames). On a naive single-stream transport this would saturate the
-//! shared flow-control window and stall every other topic. On Vireon,
-//! each dedicated stream has its own QUIC flow-control + loss-recovery
-//! window, so `audio`, `events`, `rpc`, `telem` keep flowing at full
-//! rate with stable latency.
+//! The `video` stream generates the bulk of the data. On a naive
+//! single-stream transport this would saturate the shared flow-control
+//! window and stall every other topic. On Vireon, each dedicated stream
+//! has its own QUIC flow-control + loss-recovery window, so `audio`,
+//! `events`, `rpc`, `telem` keep flowing at full rate with stable latency.
 //!
 //! ## Run
 //!
@@ -19,15 +18,7 @@
 //!
 //! ## What you should see
 //!
-//! ```text
-//!   video       LatestOnly        ~134   ~2.1 MiB/s  ~460μs  ~2ms  ⚠ heaviest
-//!   audio       ReliableOrdered   ~134   ~530 KiB/s  ~410μs  ~2ms  ✓ healthy
-//!   events      RealtimeDropOld   ~134    ~67 KiB/s  ~390μs  ~2ms  ✓ healthy
-//!   rpc         ReliableOrdered   ~134    ~33 KiB/s  ~390μs  ~2ms  ✓ healthy
-//!   telem       LatestOnly        ~134     ~8 KiB/s  ~380μs  ~2ms  ✓ healthy
-//! ```
-//!
-//! Despite video carrying 75% of the total byte load, every lighter
+//! Despite video carrying the majority of the total byte load, every lighter
 //! stream delivers at 100% with stable latency. That is the moat.
 //!
 //! ## Throughput note
@@ -74,11 +65,9 @@ const WORKLOADS: &[StreamWorkload] = &[
         name: "video",
         topic: "hol.video",
         policy: DeliveryPolicy::LatestOnly,
-        // 16 KiB frames at 200/s target = ~2 MiB/s after publish overhead.
-        // Subscriber can drain ~2 MiB/s across all streams; video's share
-        // pushes it to the edge, creating natural congestion on the video
-        // stream (LatestOnly drops intermediate frames) while the lighter
-        // streams stay healthy.
+        // 16 KiB frames at 200/s target — the heaviest stream by design,
+        // creating natural congestion on the video stream (LatestOnly drops
+        // intermediate frames) while the lighter streams stay healthy.
         payload: 16 * 1024,
         target_rate: 200,
     },

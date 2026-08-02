@@ -25,11 +25,9 @@
 //!
 //! ## What you should see
 //!
-//! ```text
-//!   [single, workers=1]   received: 500/500 gaps: 0 dups: 0   12,345 msgs/s  14.2 MiB/s
-//!   [multi,  workers=4]   received: 500/500 gaps: 0 dups: 0   18,902 msgs/s  21.7 MiB/s
-//!   ✓ BOTH MODES VERIFIED — SDK works in single and multi-core
-//! ```
+//! Both modes should report `received: 500/500 gaps: 0 dups: 0` —
+//! verifying the SDK works correctly under both single-worker and
+//! multi-worker server configurations.
 
 #![allow(clippy::print_stdout)]
 
