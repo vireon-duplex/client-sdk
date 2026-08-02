@@ -1,10 +1,10 @@
 //! The connection task, command channel, and subscriber routing.
 //!
 //! [`Client`] is a cheap, [`Clone`] handle holding only the command-channel
-//! sender. All real work happens in the background [`run`] task, which owns the
-//! [`Transport`] (and therefore the `!Sync` `quiche::Connection`) and a routing
-//! table that demultiplexes inbound frames to subscriptions / dedicated
-//! streams.
+//! sender. All real work happens in the background connection task, which
+//! owns the QUIC transport (and therefore the `!Sync`
+//! `quiche::Connection`) and a routing table that demultiplexes inbound
+//! frames to subscriptions / dedicated streams.
 //!
 //! ## Inbound routing
 //!
