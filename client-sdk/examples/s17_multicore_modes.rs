@@ -37,8 +37,8 @@ mod bench_common;
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    connect_ready, ephemeral_port, init_tracing, print_footer, print_header, write_dev_cert,
-    ServerGuard,
+    ServerGuard, connect_ready, ephemeral_port, init_tracing, print_footer, print_header,
+    write_dev_cert,
 };
 
 /// Frames published per trial. 500 is enough to surface cross-worker
@@ -91,14 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trials: Vec<Trial> = Vec::new();
 
     if !skip_single {
-        trials.push(
-            run_trial("single", 1, /*mode_single=*/ true).await,
-        );
+        trials.push(run_trial("single", 1, /*mode_single=*/ true).await);
     }
     if !skip_multi {
-        trials.push(
-            run_trial("multi", multi_workers, /*mode_single=*/ false).await,
-        );
+        trials.push(run_trial("multi", multi_workers, /*mode_single=*/ false).await);
     }
 
     // ── Report ──────────────────────────────────────────────────────
@@ -146,12 +142,7 @@ async fn run_trial(mode: &str, workers: u32, mode_single: bool) -> Trial {
     let mode_str = if mode_single { "single" } else { "multi" };
     let workers_str = Box::leak(workers.to_string().into_boxed_str());
     let mode_str_leaked: &'static str = Box::leak(mode_str.to_string().into_boxed_str());
-    let extra: Vec<&str> = vec![
-        "--mode",
-        mode_str_leaked,
-        "--workers",
-        workers_str,
-    ];
+    let extra: Vec<&str> = vec!["--mode", mode_str_leaked, "--workers", workers_str];
 
     let guard = ServerGuard::start_with(port, &cert, &key, &extra)
         .unwrap_or_else(|e| panic!("spawn server ({mode}): {e}"));
@@ -179,10 +170,7 @@ async fn run_trial(mode: &str, workers: u32, mode_single: bool) -> Trial {
         // Clone the buffer so the SDK owns its own copy. (publish takes
         // `impl Payload`; a &[u8] borrow would also work but we want to
         // re-use `buf` next iteration.)
-        pub_client
-            .publish(TOPIC, &buf[..])
-            .await
-            .expect("publish");
+        pub_client.publish(TOPIC, &buf[..]).await.expect("publish");
     }
     let elapsed = start.elapsed();
 
