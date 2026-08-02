@@ -41,9 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bench_common::{
-    connect_ready, init_tracing, print_footer, print_header, resolve_server,
-};
+use bench_common::{connect_ready, init_tracing, print_footer, print_header, resolve_server};
 use vireon_sdk::ClientPool;
 
 fn pool_size() -> usize {
@@ -227,7 +225,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "│  throughput:  {:.2} MiB/s   (e2e)",
-        received as f64 * sz as f64 / effective_elapsed.as_secs_f64().max(0.001) / (1024.0 * 1024.0)
+        received as f64 * sz as f64
+            / effective_elapsed.as_secs_f64().max(0.001)
+            / (1024.0 * 1024.0)
     );
     println!("└──────────────────────────────────────────────────────────────");
 

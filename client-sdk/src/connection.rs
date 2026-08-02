@@ -1216,11 +1216,8 @@ impl TaskState {
         };
         let entry = self.group_subs.swap_remove(idx);
         let buf = encode_group_leave(topic, group, consumer);
-        let header = FrameHeader::new(
-            StreamId::new(entry.sid),
-            MessageType::ConsumerGroupLeave,
-        )
-        .with_seq(self.next_seq(entry.sid));
+        let header = FrameHeader::new(StreamId::new(entry.sid), MessageType::ConsumerGroupLeave)
+            .with_seq(self.next_seq(entry.sid));
         let _ = self.encode_and_send_raw(header, &buf, entry.sid, transport);
         let _ = transport.flush();
         // Drop the dispatch entry; inbound publishes for `sid` will be
@@ -1338,15 +1335,20 @@ impl TaskState {
         let group_replay: Vec<(u64, String, String, String, u32)> = self
             .group_subs
             .iter()
-            .map(|e| (e.sid, e.topic.clone(), e.group.clone(), e.consumer.clone(), e.partitions))
+            .map(|e| {
+                (
+                    e.sid,
+                    e.topic.clone(),
+                    e.group.clone(),
+                    e.consumer.clone(),
+                    e.partitions,
+                )
+            })
             .collect();
         for (sid, topic, group, consumer, partitions) in &group_replay {
             let buf = encode_group_join(topic, group, consumer, *partitions);
-            let h = FrameHeader::new(
-                StreamId::new(*sid),
-                MessageType::ConsumerGroupJoin,
-            )
-            .with_seq(self.next_seq(*sid));
+            let h = FrameHeader::new(StreamId::new(*sid), MessageType::ConsumerGroupJoin)
+                .with_seq(self.next_seq(*sid));
             if let Err(e) = transport.send_frame(h, &buf, *sid) {
                 tracing::warn!(
                     stream_id = sid,
@@ -1456,17 +1458,13 @@ pub(crate) async fn run(
         // (LogTail delivery). Each request asks the server to replay one
         // WAL entry; the FetchReply arrives on the next recv cycle.
         while let Some((topic_bytes, offset, sid)) = state.pending_fetches.pop() {
-            let mut buf =
-                Vec::with_capacity(2 + topic_bytes.len() + 8 + 4);
+            let mut buf = Vec::with_capacity(2 + topic_bytes.len() + 8 + 4);
             buf.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
             buf.extend_from_slice(&topic_bytes);
             buf.extend_from_slice(&offset.to_be_bytes());
             buf.extend_from_slice(&1u32.to_be_bytes()); // max_count = 1
-            let header = FrameHeader::new(
-                StreamId::new(sid),
-                MessageType::Fetch,
-            )
-            .with_seq(state.next_seq(sid));
+            let header = FrameHeader::new(StreamId::new(sid), MessageType::Fetch)
+                .with_seq(state.next_seq(sid));
             if let Err(e) = transport.send_frame(header, &buf, sid) {
                 tracing::warn!(error = %e, "[client] fetch send failed (logtail)");
             }
@@ -1765,9 +1763,7 @@ fn encode_group_join(topic: &str, group: &str, consumer: &str, partitions: u32) 
     let tl = u16::try_from(topic.len()).unwrap_or(u16::MAX);
     let gl = u16::try_from(group.len()).unwrap_or(u16::MAX);
     let cl = u16::try_from(consumer.len()).unwrap_or(u16::MAX);
-    let mut buf = Vec::with_capacity(
-        2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4,
-    );
+    let mut buf = Vec::with_capacity(2 + topic.len() + 2 + group.len() + 2 + consumer.len() + 4);
     buf.extend_from_slice(&tl.to_be_bytes());
     buf.extend_from_slice(topic.as_bytes());
     buf.extend_from_slice(&gl.to_be_bytes());
@@ -1856,10 +1852,7 @@ mod tests {
         // topic="t", group="g", consumer="c", partitions=1
         let b = encode_group_join("t", "g", "c", 1);
         // Expected: 0,1,'t' | 0,1,'g' | 0,1,'c' | 0,0,0,1
-        assert_eq!(
-            b,
-            &[0, 1, b't', 0, 1, b'g', 0, 1, b'c', 0, 0, 0, 1]
-        );
+        assert_eq!(b, &[0, 1, b't', 0, 1, b'g', 0, 1, b'c', 0, 0, 0, 1]);
     }
 
     #[test]
@@ -1890,7 +1883,10 @@ mod tests {
         // partitions tail
         pos += clen;
         assert_eq!(b.len() - pos, 4);
-        assert_eq!(u32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]), 8);
+        assert_eq!(
+            u32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]),
+            8
+        );
     }
 
     #[test]

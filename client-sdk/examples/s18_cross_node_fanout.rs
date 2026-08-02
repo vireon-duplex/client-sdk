@@ -29,8 +29,8 @@ mod bench_common;
 use std::time::Duration;
 
 use bench_common::{
-    connect_ready, ephemeral_port, init_tracing, print_footer, print_header, write_dev_cert,
-    ServerGuard,
+    ServerGuard, connect_ready, ephemeral_port, init_tracing, print_footer, print_header,
+    write_dev_cert,
 };
 use vireon_sdk::Subscription;
 
@@ -180,11 +180,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Subscribers on all 3 nodes ──────────────────────────────────
     let sub1_client = connect_ready(&format!("127.0.0.1:{q1}")).await;
-    let mut sub1 = sub1_client.subscribe(TOPIC).await.expect("subscribe node 1");
+    let mut sub1 = sub1_client
+        .subscribe(TOPIC)
+        .await
+        .expect("subscribe node 1");
     let sub2_client = connect_ready(&format!("127.0.0.1:{q2}")).await;
-    let mut sub2 = sub2_client.subscribe(TOPIC).await.expect("subscribe node 2");
+    let mut sub2 = sub2_client
+        .subscribe(TOPIC)
+        .await
+        .expect("subscribe node 2");
     let sub3_client = connect_ready(&format!("127.0.0.1:{q3}")).await;
-    let mut sub3 = sub3_client.subscribe(TOPIC).await.expect("subscribe node 3");
+    let mut sub3 = sub3_client
+        .subscribe(TOPIC)
+        .await
+        .expect("subscribe node 3");
     println!("[subscribers] connected to nodes 1, 2, 3");
 
     // Wait for Subscribe frames to propagate to all nodes via the
@@ -206,10 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 *b = pattern;
             }
         }
-        pub_client
-            .publish(TOPIC, &buf[..])
-            .await
-            .expect("publish");
+        pub_client.publish(TOPIC, &buf[..]).await.expect("publish");
     }
     let pub_elapsed = start.elapsed();
     let pub_fps = PUBLISHES as f64 / pub_elapsed.as_secs_f64();
@@ -241,13 +247,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  node 2:  delivered {d2}  gaps {g2c}  dup {dup2}");
     println!("  node 3:  delivered {d3}  gaps {g3c}  dup {dup3}");
 
-    let ok = d1 == PUBLISHES && g1c == 0 && dup1 == 0
-        && d2 == PUBLISHES && g2c == 0 && dup2 == 0
-        && d3 == PUBLISHES && g3c == 0 && dup3 == 0;
+    let ok = d1 == PUBLISHES
+        && g1c == 0
+        && dup1 == 0
+        && d2 == PUBLISHES
+        && g2c == 0
+        && dup2 == 0
+        && d3 == PUBLISHES
+        && g3c == 0
+        && dup3 == 0;
 
     println!();
     if ok {
-        println!("  \u{2713} CROSS-NODE FAN-OUT VERIFIED — all 3 nodes received all {PUBLISHES} messages");
+        println!(
+            "  \u{2713} CROSS-NODE FAN-OUT VERIFIED — all 3 nodes received all {PUBLISHES} messages"
+        );
     } else {
         println!("  \u{2717} VERIFICATION FAILED");
     }
@@ -275,10 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Drain a subscriber and return `(delivered, gaps, duplicates)`.
 /// Exits early once `PUBLISHES` unique messages have been received
 /// (avoids inflating delivery time with unnecessary drain-wait).
-async fn drain_verify(
-    sub: &mut Subscription,
-    _label: &str,
-) -> (u64, u64, u64) {
+async fn drain_verify(sub: &mut Subscription, _label: &str) -> (u64, u64, u64) {
     let mut ids: Vec<u64> = Vec::with_capacity(PUBLISHES as usize);
     let mut dups: u64 = 0;
     let deadline = std::time::Instant::now() + DRAIN;

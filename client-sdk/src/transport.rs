@@ -284,12 +284,9 @@ impl Transport {
             // pub/sub control messages (Subscribe, Ack, heartbeat, small
             // Publishes) fit here, avoiding BytesMut overhead entirely.
             let mut stack_buf = [0u8; STACK_ENCODE_MAX];
-            let written = frame::codec::encode_into_slice(
-                &mut stack_buf[..wire_size],
-                header,
-                payload,
-            )
-            .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
+            let written =
+                frame::codec::encode_into_slice(&mut stack_buf[..wire_size], header, payload)
+                    .map_err(|e| ConnectError::Config(format!("frame encode failed: {e}")))?;
             return self.stream_send(stream_id, &stack_buf[..written]);
         }
 

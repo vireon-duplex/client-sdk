@@ -43,9 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bench_common::{
-    connect_ready, init_tracing, print_footer, print_header, resolve_server,
-};
+use bench_common::{connect_ready, init_tracing, print_footer, print_header, resolve_server};
 use vireon_sdk::{DeliveryPolicy, StreamSpec};
 
 /// How long to publish before triggering migration.
@@ -62,9 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a dev server (migration = true by default).
     let (addr, _server) = resolve_server().await;
 
-    print_header("Scenario 19 — Connection Migration (NAT rebinding)", PHASE1_DURATION, &addr);
+    print_header(
+        "Scenario 19 — Connection Migration (NAT rebinding)",
+        PHASE1_DURATION,
+        &addr,
+    );
 
-    print_header("Scenario 19 — Connection Migration (NAT rebinding)", PHASE1_DURATION, &addr);
+    print_header(
+        "Scenario 19 — Connection Migration (NAT rebinding)",
+        PHASE1_DURATION,
+        &addr,
+    );
     println!("  migration: enabled (server default)");
     println!();
 
@@ -99,7 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── trigger connection migration ────────────────────────────────
     println!("\n  \u{27f3} rebinding UDP socket \u{2014} triggering connection migration\u{2026}");
-    sub_client.migrate("0.0.0.0:0").await.expect("migrate (rebind)");
+    sub_client
+        .migrate("0.0.0.0:0")
+        .await
+        .expect("migrate (rebind)");
     println!("  \u{2713} UDP socket rebound \u{2014} QUIC connection migrated to new 4-tuple");
 
     // Wait for server path validation (PATH_CHALLENGE / PATH_RESPONSE).
