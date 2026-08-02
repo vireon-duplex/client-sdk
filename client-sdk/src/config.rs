@@ -63,10 +63,9 @@ impl Default for TlsVerify {
 /// mTLS deployments typically combine
 /// [`TlsVerify::Strict`] with a [`ClientIdentity`].
 ///
-/// ```
-/// # use vireon_sdk::{ClientBuilder, ClientIdentity, TlsVerify};
-/// # fn demo() -> Result<(), vireon_sdk::ConnectError> {
-/// # async {
+/// ```no_run
+/// use vireon_sdk::{ClientBuilder, ClientIdentity, TlsVerify};
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let _ = ClientBuilder::new("127.0.0.1:4433")
 ///     .sni("localhost")
 ///     .tls_verify(TlsVerify::Strict { ca: "/etc/vireon/ca.pem".into() })
@@ -76,10 +75,7 @@ impl Default for TlsVerify {
 ///     })
 ///     .connect()
 ///     .await?;
-/// # Ok::<_, vireon_sdk::ConnectError>(())
-/// # });
-/// # Ok(())
-/// # }
+/// # Ok(()) }
 /// ```
 #[derive(Clone, Debug)]
 pub struct ClientIdentity {
@@ -179,7 +175,7 @@ pub(crate) struct ClientConfig {
 ///
 /// Construct with [`ClientBuilder::new`], chain setters, then [`connect`].
 /// Cloning the builder (e.g. for [`ClientPool::connect`](crate::ClientPool::connect))
-/// produces an identical builder — the wrapped [`ClientConfig`] is already
+/// produces an identical builder — the wrapped config is already
 /// `Clone`.
 ///
 /// [`connect`]: ClientBuilder::connect
