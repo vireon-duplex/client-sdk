@@ -47,8 +47,8 @@ mod bench_common;
 use std::time::Duration;
 
 use bench_common::{
-    connect_ready, ephemeral_port, init_tracing, print_footer, print_header, write_dev_cert,
-    ServerGuard,
+    ServerGuard, connect_ready, ephemeral_port, init_tracing, print_footer, print_header,
+    write_dev_cert,
 };
 
 /// Number of publishes to fan out across the cluster.
@@ -96,9 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c1 = ephemeral_port().expect("cluster udp 1");
     let c2 = ephemeral_port().expect("cluster udp 2");
     let c3 = ephemeral_port().expect("cluster udp 3");
-    let peers = format!(
-        "1=127.0.0.1:{c1},2=127.0.0.1:{c2},3=127.0.0.1:{c3}"
-    );
+    let peers = format!("1=127.0.0.1:{c1},2=127.0.0.1:{c2},3=127.0.0.1:{c3}");
 
     print_header(
         "Scenario 16 — Cluster Replication & Cross-node Routing",
@@ -164,12 +162,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     for n in 0u64..PUBLISHES {
         let payload = n.to_be_bytes();
-        pub_client
-            .publish(TOPIC, &payload)
-            .await
-            .expect("publish");
+        pub_client.publish(TOPIC, &payload).await.expect("publish");
     }
-    println!("[publisher] published {PUBLISHES} frames in {:?}", start.elapsed());
+    println!(
+        "[publisher] published {PUBLISHES} frames in {:?}",
+        start.elapsed()
+    );
 
     // ── Drain + verify ──────────────────────────────────────────────
     let mut ids: Vec<u64> = Vec::with_capacity(PUBLISHES as usize);

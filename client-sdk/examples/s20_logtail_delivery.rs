@@ -30,8 +30,8 @@ mod bench_common;
 use std::time::Duration;
 
 use bench_common::{
-    connect_ready, ephemeral_port, init_tracing, print_footer, print_header, write_dev_cert,
-    ServerGuard,
+    ServerGuard, connect_ready, ephemeral_port, init_tracing, print_footer, print_header,
+    write_dev_cert,
 };
 
 /// Number of messages to publish.
@@ -56,9 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = cfg_dir.join("s20.toml");
     std::fs::write(
         &cfg_path,
-        format!(
-            "[delivery]\nforce_strategy = \"logtail\"\nlogtail_threshold = 1\n"
-        ),
+        format!("[delivery]\nforce_strategy = \"logtail\"\nlogtail_threshold = 1\n"),
     )
     .expect("write config");
 
@@ -88,7 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = format!("127.0.0.1:{port}");
 
-    print_header("Scenario 20 — LogTail Adaptive Delivery", Duration::from_secs(0), &addr);
+    print_header(
+        "Scenario 20 — LogTail Adaptive Delivery",
+        Duration::from_secs(0),
+        &addr,
+    );
     println!("  publishes: {PUBLISHES}");
     println!("  topic:     {TOPIC}");
     println!("  strategy:  forced logtail (WAL + NotifyOffset + Fetch)");
@@ -141,7 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fetch_count = sub_client.fetch_reply_count();
 
     println!();
-    println!("  delivered:           {received_count}", received_count = received.len());
+    println!(
+        "  delivered:           {received_count}",
+        received_count = received.len()
+    );
     println!("  duplicates:          {dups}");
     println!("  gaps:                {gaps}");
     println!("  NotifyOffset frames: {notify_count}");
