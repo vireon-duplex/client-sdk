@@ -9,7 +9,6 @@
 //! ## Inbound routing
 //!
 //! The server records the **transport stream id** a `Subscribe` arrives on
-//! (`application-layer/pubsub-engine/src/registry.rs:35` — `Subscriber.quic_stream_id`)
 //! and fans matching publishes back onto that same stream. So:
 //!
 //! * default-channel subscriptions share QUIC stream 0 — inbound frames there
@@ -1106,8 +1105,8 @@ impl TaskState {
 
         // 1) Declare the stream's delivery policy via StreamOpen. The payload
         //    MUST be the `StreamOpenMeta` byte — the server decodes exactly
-        //    this at application.rs:2144. Do NOT use frame::payload::StreamOpen
-        //    (different encoding: a direction byte the server ignores).
+        //    this byte. Do NOT use frame::payload::StreamOpen (different
+        //    encoding: a direction byte the server ignores).
         let policy_bytes = StreamOpenMeta::new(spec.policy).encode();
         let header = FrameHeader::new(StreamId::new(sid), MessageType::StreamOpen)
             .with_seq(self.next_seq(sid));
@@ -1166,9 +1165,8 @@ impl TaskState {
         );
 
         // Declare the stream + a normal Subscribe on the topic. Without
-        // StreamOpen, the server's `application.rs:handle_stream_open`
-        // never assigns a policy and the stream is unknown to the
-        // per-connection bookkeeping that gates `route_publish` fan-out.
+        // StreamOpen, the server never assigns a policy and the stream is
+        // unknown to the per-connection bookkeeping that gates fan-out.
         // Without Subscribe, the server has no `Subscriber` entry in
         // `pubsub_registry` — `route_publish` finds zero local targets
         // and the publish is dropped before reaching `group_locals`.
@@ -1578,10 +1576,9 @@ pub(crate) async fn run(
                             // by stream_send (awaiting a flow-control window
                             // from the peer) would be silently dropped.
                             //
-                            // 10 s covers the worst-case cmd-channel backlog:
-                            // CAP=4096 × 64 KiB = 256 MiB, at ~35 MiB/s that's
-                            // ~7 s. With small frames (8 KiB) pending is
-                            // typically <1 MB and drain returns in <100 ms.
+                            // 10 s covers the worst-case cmd-channel backlog
+                            // under heavy load. With small frames pending is
+                            // typically minimal and drain returns quickly.
                             const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
                             if !transport.drain_pending_gracefully(DRAIN_TIMEOUT).await {
                                 tracing::warn!(
