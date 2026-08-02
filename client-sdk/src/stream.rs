@@ -1,13 +1,12 @@
 //! Dedicated logical streams with per-stream delivery semantics.
 //!
-//! Opening a [`StreamHandle`] via [`Client::open_stream`] allocates a
+//! Opening a [`StreamHandle`] via [`crate::Client::open_stream`] allocates a
 //! dedicated QUIC bidirectional stream and declares its [`DeliveryPolicy`] to
 //! the server with a `StreamOpen` frame. The server records the policy for
-//! that stream (`quic-server/.../application.rs:2144` → `bind_send_policy`) and
-//! applies it to every frame it fans out onto that stream.
+//! that stream and applies it to every frame it fans out onto that stream.
 //!
 //! Because the server records the **transport stream id** the `Subscribe`
-//! arrived on (`Subscriber.quic_stream_id`), deliveries for a subscription
+//! arrived on, deliveries for a subscription
 //! issued on a dedicated stream come back on that same stream — giving genuine
 //! head-of-line blocking isolation between streams. Congestion or retransmission
 //! on one dedicated stream never blocks another.
@@ -122,10 +121,9 @@ impl StreamHandle {
     /// the egress side to matching subscribers).
     ///
     /// This routes the publish through the same connection task as
-    /// [`Client::publish`], but tags it with [`StreamSel::Dedicated`] so it
-    /// leaves on this stream's id.
-    ///
-    /// [`Client::publish`]: crate::Client::publish
+    /// [`Client::publish`](crate::Client::publish), but tags it with the
+    /// stream selector for this dedicated stream so it leaves on this
+    /// stream's id.
     pub async fn publish(
         &self,
         topic: &str,

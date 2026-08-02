@@ -101,5 +101,9 @@ path = "examples/s18_cross_node_fanout.rs"
 name = "s19_connection_migration"
 path = "examples/s19_connection_migration.rs"
 
+[[example]]
+name = "s20_logtail_delivery"
+path = "examples/s20_logtail_delivery.rs"
+
 [lints]
 workspace = true
