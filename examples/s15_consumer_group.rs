@@ -97,10 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     for n in 0..PUBLISHES {
         let payload = n.to_be_bytes();
-        pub_client
-            .publish(TOPIC, &payload)
-            .await
-            .expect("publish");
+        pub_client.publish(TOPIC, &payload).await.expect("publish");
     }
     println!("  published: {PUBLISHES} in {:?}", start.elapsed());
 
