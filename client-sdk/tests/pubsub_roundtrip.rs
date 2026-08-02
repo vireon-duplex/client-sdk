@@ -371,7 +371,10 @@ async fn connection_migration_survives_rebind() {
     // The heartbeat probes (sent every 1s from the new address) replenish
     // the budget, but large or burst deliveries can still be flow-blocked.
     // This is a quiche 0.22 transport-layer constraint, not a Vireon bug.
-    let sub2 = sub_client.subscribe("data.*").await.expect("re-subscribe post-migration");
+    let sub2 = sub_client
+        .subscribe("data.*")
+        .await
+        .expect("re-subscribe post-migration");
     println!("[e2e-migrate] post-migration subscribe OK — bidirectional traffic confirmed");
     drop(sub2);
     drop(sub);
