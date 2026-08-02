@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bench_common::{
-    Histogram, connect_ready, fmt_ns, init_tracing, print_footer, print_header, resolve_server,
+    connect_ready, init_tracing, print_footer, print_header, resolve_server,
 };
 use vireon_sdk::ClientPool;
 
@@ -135,7 +135,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let payload = vec![0u8; sz];
     let sent = Arc::new(AtomicU64::new(0));
+    let received_arc = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
+
+    // ── concurrent drain task ────────────────────────────────────────
+    // Spawn the recv loop BEFORE publishing so the subscriber drains
+    // concurrently with the publish burst. Without this, a 50 K-frame
+    // burst fills the subscriber channel (>65 K depth) and the background
+    // task drops messages via try_send — causing 60%+ apparent "loss".
+    // Concurrent drain lets the subscriber keep pace with fan-out.
+    let recv_counter = received_arc.clone();
+    let drain_start = Instant::now();
+    let drain_task = tokio::spawn(async move {
+        let mut local_received: u64 = 0;
+        let mut last_recv = drain_start;
+        loop {
+            // 10 s idle timeout: once the publisher stops and the server
+            // drains its queues, no more frames arrive.
+            match tokio::time::timeout(Duration::from_secs(10), sub.recv()).await {
+                Ok(Some(_msg)) => {
+                    local_received += 1;
+                    last_recv = Instant::now();
+                    recv_counter.store(local_received, Ordering::Relaxed);
+                }
+                Ok(None) => break, // stream closed
+                Err(_) => break,   // idle timeout → done
+            }
+        }
+        (local_received, last_recv)
+    });
 
     // Publish round-robin via the pool. try_publish fails over across
     // members so a single saturated member doesn't stall the producer.
@@ -169,29 +197,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         total as f64 / publish_elapsed.as_secs_f64(),
     );
 
-    // ── drain subscriber ─────────────────────────────────────────────
-    let expected = total;
-    let mut hist = Histogram::default();
-    let mut received: u64 = 0;
-    let drain_deadline = Instant::now() + Duration::from_secs(30);
-
-    while received < expected {
-        let recv = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await;
-        match recv {
-            Ok(Some(_msg)) => {
-                hist.record(publish_elapsed.as_nanos() as u64);
-                received += 1;
-            }
-            Ok(None) => break, // stream closed
-            Err(_) => {
-                if Instant::now() >= drain_deadline {
-                    break;
-                }
-            }
-        }
-    }
+    // ── wait for drain task to finish ────────────────────────────────
+    // The drain task exits after a 10 s idle period (no new frames).
+    // This gives the server time to flush its fan-out queues after the
+    // publisher stops.
+    let (received, last_recv) = drain_task.await.unwrap_or((0, drain_start));
+    let effective_elapsed = last_recv.saturating_duration_since(drain_start);
 
     let elapsed = start.elapsed();
+    let expected = total;
     let lost = expected.saturating_sub(received);
     let loss_pct = if expected == 0 {
         0.0
@@ -208,15 +222,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("│  lost:        {lost}   ({loss_pct:.2}%)");
     println!("│  publish t:   {:.2}s", publish_elapsed.as_secs_f64());
     println!(
-        "│  total t:     {:.2}s   (incl. drain)",
-        elapsed.as_secs_f64()
+        "│  e2e t:       {:.2}s   (publish→last-recv, excl. idle wait)",
+        effective_elapsed.as_secs_f64()
     );
-    if let Some(p50) = hist.percentile(50.0) {
-        println!("│  e2e p50:     {}   (publish→recv)", fmt_ns(p50));
-    }
     println!(
-        "│  throughput:  {:.2} MiB/s",
-        received as f64 * sz as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+        "│  throughput:  {:.2} MiB/s   (e2e)",
+        received as f64 * sz as f64 / effective_elapsed.as_secs_f64().max(0.001) / (1024.0 * 1024.0)
     );
     println!("└──────────────────────────────────────────────────────────────");
 

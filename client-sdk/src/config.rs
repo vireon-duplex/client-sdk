@@ -158,7 +158,11 @@ pub(crate) struct ClientConfig {
     pub reconnect: ReconnectPolicy,
     /// Maximum accepted payload size for a single message (defensive cap).
     pub max_message_size: usize,
-    /// Depth of each subscriber's bounded channel.
+    /// Depth of each subscriber's bounded channel. When the channel is
+    /// full, incoming messages are dropped (the I/O task must not block).
+    /// Default 65 536 — large enough to absorb typical publish bursts.
+    /// Payloads are `Bytes` (Arc-cloned), so per-slot memory is ~56 B
+    /// struct + shared payload allocation.
     pub subscriber_buffer: usize,
     /// Depth of the command channel between [`Client`] handles and the
     /// background I/O task. Larger values absorb `try_publish` bursts;
@@ -204,7 +208,7 @@ impl ClientBuilder {
                 client_identity: None,
                 reconnect: ReconnectPolicy::default(),
                 max_message_size: 1024 * 1024,
-                subscriber_buffer: 8192,
+                subscriber_buffer: 65536,
                 cmd_channel_cap: 1024,
                 idle_timeout: Duration::from_secs(60),
             },
