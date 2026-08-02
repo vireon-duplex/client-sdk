@@ -237,7 +237,7 @@ Two clients (subscriber + publisher), default channel + a dedicated
 
 | Scenario | Run | Proves |
 |----------|-----|--------|
-| **s07** HOL isolation | `cargo run -p vireon-sdk --release --example s07_hol_congestion` | 5 dedicated streams (video 16 KiB @ ~2 MiB/s + audio/events/rpc/telem) — video congestion never degrades the lighter streams |
+| **s07** HOL isolation | `cargo run -p vireon-sdk --release --example s07_hol_congestion` | 5 dedicated streams (video 16 KiB + audio/events/rpc/telem) — video congestion never degrades the lighter streams |
 | **s09** Reconnect + resubscribe | `cargo run -p vireon-sdk --release --example s09_reconnect` | Server is killed mid-session; the SDK detects peer death, reconnects with backoff, replays all subscriptions, and delivery resumes in <5 s |
 | **s11** Sequence integrity | `cargo run -p vireon-sdk --release --example s11_ordering` | 500 frames on a `ReliableOrdered` dedicated stream — every frame received exactly once, in ascending order, zero gaps |
 
@@ -252,16 +252,15 @@ from trying to compile it.
 
 The headline Vireon differentiator proof. One subscriber opens 5
 dedicated QUIC streams; one publisher fires 5 workloads on the default
-channel. The `video` stream carries 75 % of the byte load (16 KiB
-frames at ~2 MiB/s); the other four stay at 100 % delivery with stable
-p99 latency (~2 ms):
+channel. The `video` stream carries the bulk of the byte load (16 KiB
+frames); the other four stay at 100 % delivery with stable latency:
 
 ```text
-video    LatestOnly        134/s  100.0%  2.09 MiB/s  ⚠ heaviest
-audio    ReliableOrdered   134/s  100.0%  536 KiB/s   ✓ healthy
-events   RealtimeDropOld   134/s  100.0%  67 KiB/s    ✓ healthy
-rpc      ReliableOrdered   134/s  100.0%  34 KiB/s    ✓ healthy
-telem    LatestOnly        134/s  100.0%  8 KiB/s     ✓ healthy
+video    LatestOnly        …      100.0%  ⚠ heaviest stream
+audio    ReliableOrdered   …      100.0%  ✓ healthy
+events   RealtimeDropOld   …      100.0%  ✓ healthy
+rpc      ReliableOrdered   …      100.0%  ✓ healthy
+telem    LatestOnly        …      100.0%  ✓ healthy
 ✓ HOL ISOLATION VERIFIED
 ```
 
