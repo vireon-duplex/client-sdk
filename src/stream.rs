@@ -117,6 +117,16 @@ impl StreamHandle {
         self.rx.recv().await
     }
 
+    /// Non-blocking receive. Returns `Some(msg)` if a message is buffered in
+    /// the channel, or `None` if the channel is empty (or closed).
+    ///
+    /// Use after `recv().await` to drain additional buffered messages without
+    /// paying the async scheduler overhead per message.
+    #[inline]
+    pub fn try_recv(&mut self) -> Option<Message> {
+        self.rx.try_recv().ok()
+    }
+
     /// Publish on this dedicated stream (uses the stream's declared policy on
     /// the egress side to matching subscribers).
     ///

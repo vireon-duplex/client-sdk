@@ -36,6 +36,16 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<Message> {
         self.rx.recv().await
     }
+
+    /// Non-blocking receive. Returns `Some(msg)` if a message is buffered in
+    /// the channel, or `None` if the channel is empty (or closed).
+    ///
+    /// Use after `recv().await` to drain additional buffered messages without
+    /// paying the async scheduler overhead per message.
+    #[inline]
+    pub fn try_recv(&mut self) -> Option<Message> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Receiver for messages delivered to a consumer-group member.
@@ -64,5 +74,12 @@ impl GroupSubscription {
     #[inline]
     pub async fn recv(&mut self) -> Option<Message> {
         self.rx.recv().await
+    }
+
+    /// Non-blocking receive. Returns `Some(msg)` if a message is buffered in
+    /// the channel, or `None` if the channel is empty (or closed).
+    #[inline]
+    pub fn try_recv(&mut self) -> Option<Message> {
+        self.rx.try_recv().ok()
     }
 }
