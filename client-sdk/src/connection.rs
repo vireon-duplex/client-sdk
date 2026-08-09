@@ -172,6 +172,9 @@ pub struct Client {
     /// Mirror of duplicate reliable frames detected & suppressed by the
     /// dedup watermark. Read via [`Self::duplicates_detected`].
     duplicates_detected: Arc<std::sync::atomic::AtomicU64>,
+    /// When `true`, `publish()` retries with backoff on
+    /// [`PublishError::Backpressure`] instead of returning immediately.
+    publish_blocking: bool,
 }
 
 impl Client {
@@ -186,6 +189,7 @@ impl Client {
         notify_offset_count: Arc<std::sync::atomic::AtomicU64>,
         fetch_reply_count: Arc<std::sync::atomic::AtomicU64>,
         duplicates_detected: Arc<std::sync::atomic::AtomicU64>,
+        publish_blocking: bool,
     ) -> Self {
         Self {
             tx,
@@ -193,6 +197,7 @@ impl Client {
             notify_offset_count,
             fetch_reply_count,
             duplicates_detected,
+            publish_blocking,
         }
     }
 
@@ -329,10 +334,16 @@ impl Client {
             stream: StreamSel::Default,
             resp: resp_tx,
         };
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| PublishError::NotConnected)?;
+        if self.publish_blocking {
+            self.tx
+                .send(cmd)
+                .await
+                .map_err(|_| PublishError::NotConnected)?;
+        } else {
+            self.tx
+                .try_send(cmd)
+                .map_err(|_| PublishError::NotConnected)?;
+        }
         resp_rx.await.map_err(|_| PublishError::NotConnected)?
     }
 
@@ -1234,9 +1245,13 @@ impl TaskState {
         // Bytes land in quiche's per-stream send buffer; the outer run() loop
         // flushes once per iteration. Skipping a per-publish flush here is what
         // makes batch publishes share a single UDP send syscall.
-        transport
-            .send_frame(header, &buf, sid)
-            .map_err(|_| PublishError::NotConnected)?;
+        transport.send_frame(header, &buf, sid).map_err(|e| {
+            if matches!(e, ConnectError::TransportFull) {
+                PublishError::Backpressure
+            } else {
+                PublishError::NotConnected
+            }
+        })?;
         Ok(())
     }
 

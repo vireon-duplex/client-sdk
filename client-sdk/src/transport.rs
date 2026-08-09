@@ -71,6 +71,11 @@ pub(crate) struct Transport {
     /// Reusable encode buffer for `send_frame`. Avoids a `BytesMut::with_capacity`
     /// allocation per frame — cleared and re-filled each call.
     encode_buf: BytesMut,
+    /// Maximum total bytes allowed in `pending` across all streams. When
+    /// exceeded, `stream_send` returns [`ConnectError::TransportFull`] so
+    /// the caller can apply backpressure to the producer instead of
+    /// buffering indefinitely. `usize::MAX` disables (unsafe — can OOM).
+    pending_cap: usize,
 }
 
 impl Transport {
@@ -125,6 +130,7 @@ impl Transport {
             pending: HashMap::new(),
             pending_shared: Arc::new(AtomicUsize::new(0)),
             encode_buf: BytesMut::new(),
+            pending_cap: cfg.pending_cap,
         };
 
         t.handshake().await?;
@@ -312,6 +318,17 @@ impl Transport {
     /// silent frame-truncation that caused server-side `CrcMismatch` and
     /// decoder desync.
     fn stream_send(&mut self, stream_id: u64, data: &[u8]) -> Result<(), ConnectError> {
+        // Pending-buffer cap: if buffering this frame's tail would push
+        // total pending bytes over the configured limit, reject the write
+        // with TransportFull so the caller applies backpressure to the
+        // producer instead of letting the process OOM.
+        let current_pending = self.pending_bytes();
+        let projected = current_pending.saturating_add(data.len());
+        if projected > self.pending_cap {
+            self.sync_pending_shared();
+            return Err(ConnectError::TransportFull);
+        }
+
         // If there's already pending data for this stream, append to it.
         // The new data must go AFTER the buffered tail to preserve byte
         // ordering on the stream.
