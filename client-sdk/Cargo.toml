@@ -105,5 +105,9 @@ path = "examples/s19_connection_migration.rs"
 name = "s20_logtail_delivery"
 path = "examples/s20_logtail_delivery.rs"
 
+[[example]]
+name = "s21_ack_sequence_resume"
+path = "examples/s21_ack_sequence_resume.rs"
+
 [lints]
 workspace = true
