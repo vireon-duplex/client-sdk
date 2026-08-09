@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::connection::Client;
 use crate::error::ConnectError;
+use quiche::CongestionControlAlgorithm;
 
 /// How the client validates the server's TLS certificate.
 ///
@@ -194,6 +195,35 @@ pub(crate) struct ClientConfig {
     /// replays the gap immediately. Default empty (first connect / no
     /// prior state).
     pub resume_state: Vec<(u64, u64)>,
+    /// Maximum total bytes buffered in [`Transport::pending`] across all
+    /// streams. When exceeded, `publish()` returns
+    /// [`PublishError::Backpressure`] (or retries if `publish_blocking`
+    /// is enabled). Protects the process from OOM under sustained
+    /// producer > consumer throughput. Default 256 MiB.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    pub pending_cap: usize,
+    /// When `true` (default), `publish()` uses `send().await` on the
+    /// command channel (blocks when the I/O task is behind). When
+    /// `false`, `publish()` uses `try_send` and returns
+    /// [`PublishError::NotConnected`] immediately when the channel is full.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    pub publish_blocking: bool,
+    /// QUIC connection-level flow-control window (INITIAL_MAX_DATA).
+    /// Default 100 MiB.
+    pub max_data: u64,
+    /// QUIC per-stream flow-control window for bidirectional streams
+    /// (INITIAL_MAX_STREAM_DATA_BIDI_LOCAL / REMOTE). Default 10 MiB.
+    pub max_stream_data: u64,
+    /// Maximum number of concurrent bidirectional QUIC streams
+    /// (INITIAL_MAX_STREAMS_BIDI). Default 1024.
+    pub max_streams_bidi: u64,
+    /// Maximum number of concurrent unidirectional QUIC streams
+    /// (INITIAL_MAX_STREAMS_UNI). Default 1024.
+    pub max_streams_uni: u64,
+    /// QUIC congestion-control algorithm. Default CUBIC.
+    pub cc_algorithm: quiche::CongestionControlAlgorithm,
 }
 
 /// Builder for a [`Client`].
@@ -236,6 +266,13 @@ impl ClientBuilder {
                 ack_interval: 32,
                 logical_session_id: 0,
                 resume_state: Vec::new(),
+                pending_cap: 256 * 1024 * 1024,
+                publish_blocking: true,
+                max_data: 100 * 1024 * 1024,
+                max_stream_data: 10 * 1024 * 1024,
+                max_streams_bidi: 1024,
+                max_streams_uni: 1024,
+                cc_algorithm: CongestionControlAlgorithm::CUBIC,
             },
         }
     }
@@ -367,6 +404,70 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum total bytes buffered in the transport's per-stream pending
+    /// map. When exceeded, `publish()` returns
+    /// [`PublishError::Backpressure`] (or retries if `publish_blocking`
+    /// is enabled). Default 256 MiB. Set lower for memory-constrained
+    /// apps or higher for bulk-throughput workloads.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    #[must_use]
+    pub fn pending_cap(mut self, cap: usize) -> Self {
+        self.cfg.pending_cap = cap;
+        self
+    }
+
+    /// Controls whether `publish()` blocks (retries with backoff) or
+    /// returns immediately with [`PublishError::Backpressure`] when the
+    /// transport pending buffer is full. Default `true` (block).
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    #[must_use]
+    pub fn publish_blocking(mut self, enabled: bool) -> Self {
+        self.cfg.publish_blocking = enabled;
+        self
+    }
+
+    /// QUIC connection-level flow-control window
+    /// (INITIAL_MAX_DATA). Default 100 MiB. Increase for high-throughput
+    /// bulk-transfer workloads; decrease for memory-constrained clients.
+    #[must_use]
+    pub fn max_data(mut self, bytes: u64) -> Self {
+        self.cfg.max_data = bytes;
+        self
+    }
+
+    /// QUIC per-stream flow-control window for bidirectional streams.
+    /// Default 10 MiB. Applied to both local and remote bidi stream
+    /// limits.
+    #[must_use]
+    pub fn max_stream_data(mut self, bytes: u64) -> Self {
+        self.cfg.max_stream_data = bytes;
+        self
+    }
+
+    /// Maximum concurrent bidirectional QUIC streams. Default 1024.
+    #[must_use]
+    pub fn max_streams_bidi(mut self, count: u64) -> Self {
+        self.cfg.max_streams_bidi = count;
+        self
+    }
+
+    /// Maximum concurrent unidirectional QUIC streams. Default 1024.
+    #[must_use]
+    pub fn max_streams_uni(mut self, count: u64) -> Self {
+        self.cfg.max_streams_uni = count;
+        self
+    }
+
+    /// QUIC congestion-control algorithm. Default CUBIC. Use `Reno`
+    /// for low-bandwidth scenarios, `BBR` where available.
+    #[must_use]
+    pub fn congestion(mut self, algo: CongestionControlAlgorithm) -> Self {
+        self.cfg.cc_algorithm = algo;
+        self
+    }
+
     /// Establish the QUIC connection and spawn the background I/O task.
     ///
     /// Returns once the TLS handshake completes and the ALPN protocol is
@@ -375,6 +476,7 @@ impl ClientBuilder {
     /// # Errors
     /// See [`ConnectError`].
     pub async fn connect(self) -> Result<Client, ConnectError> {
+        let publish_blocking = self.cfg.publish_blocking;
         let cfg = self.cfg;
         let cap = cfg.cmd_channel_cap.max(1);
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
@@ -403,6 +505,7 @@ impl ClientBuilder {
                 notify_offset_count,
                 fetch_reply_count,
                 duplicates_detected,
+                publish_blocking,
             )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(ConnectError::Closed(
