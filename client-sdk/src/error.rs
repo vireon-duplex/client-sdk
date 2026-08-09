@@ -43,6 +43,13 @@ pub enum ConnectError {
     /// An I/O error on the UDP socket.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The local pending-sends buffer has reached its configured cap.
+    /// The caller should slow down or wait for `pending_bytes()` to drain
+    /// before retrying. This is local memory protection, not QUIC flow
+    /// control — the peer may have plenty of window.
+    #[error("transport pending buffer full (cap exceeded)")]
+    TransportFull,
 }
 
 /// Failure to publish a message.
@@ -63,6 +70,16 @@ pub enum PublishError {
     /// QUIC flow control refused the write; retry after the peer credits window.
     #[error("flow-control blocked")]
     FlowControlBlocked,
+
+    /// The local transport pending buffer has hit its cap
+    /// ([`ClientBuilder::pending_cap`]). The caller is producing faster
+    /// than the subscriber can drain AND faster than QUIC flow control
+    /// can backpressure. Slow down, batch, or check
+    /// [`Client::pending_bytes`] to monitor.
+    ///
+    /// [`Client::pending_bytes`]: crate::Client::pending_bytes
+    #[error("backpressure: local transport buffer full")]
+    Backpressure,
 }
 
 /// Failure to (un)subscribe.
