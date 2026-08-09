@@ -169,6 +169,31 @@ pub(crate) struct ClientConfig {
     /// `min(client, server)`. Lower values detect dead peers faster at the
     /// cost of tearing down quiet connections sooner.
     pub idle_timeout: Duration,
+    /// Master toggle for application-level reliability (ACK + Sequence +
+    /// Resume). When `true`, publishes carry `ACK_REQ`, inbound reliable
+    /// deliveries are deduplicated by per-stream seq, cumulative ACKs are
+    /// flushed every `ack_interval` frames, and a `Resume` frame is sent
+    /// on (re)connect so the server can re-send any gap from its replay
+    /// window. Default `false` — backward compatible with existing
+    /// ephemeral traffic.
+    pub reliable: bool,
+    /// Cumulative ACK cadence: flush an `Ack` frame every N reliable
+    /// deliveries. `1` acks every frame (highest overhead, lowest replay
+    /// pressure); `255` acks rarely. Default `32`. Only meaningful when
+    /// `reliable` is `true`.
+    pub ack_interval: u8,
+    /// Client-assigned logical session id — stable across reconnects. The
+    /// server keys its in-memory replay window by this id (NOT by the
+    /// per-connection session id, which it reassigns on each connect).
+    /// Default `0` → the SDK allocates a random id at first connect.
+    pub logical_session_id: u64,
+    /// Per-stream `(stream_id, last_acked_seq)` pairs to seed the new
+    /// client's cumulative-ACK watermarks. Used when a fresh `Client` is
+    /// created to resume a PREVIOUS session (same `logical_session_id`)
+    /// — the first-connect `Resume` carries these slots so the server
+    /// replays the gap immediately. Default empty (first connect / no
+    /// prior state).
+    pub resume_state: Vec<(u64, u64)>,
 }
 
 /// Builder for a [`Client`].
@@ -207,6 +232,10 @@ impl ClientBuilder {
                 subscriber_buffer: 65536,
                 cmd_channel_cap: 1024,
                 idle_timeout: Duration::from_secs(60),
+                reliable: false,
+                ack_interval: 32,
+                logical_session_id: 0,
+                resume_state: Vec::new(),
             },
         }
     }
@@ -283,6 +312,61 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable application-level reliability (ACK + Sequence + Resume).
+    ///
+    /// When enabled:
+    ///   * publishes set `FrameFlags::ACK_REQ` so the server retains them;
+    ///   * inbound deliveries on reliable streams are deduplicated by
+    ///     per-stream `seq` (at-least-once; duplicates suppressed);
+    ///   * a cumulative `Ack` is flushed every `ack_interval` reliable
+    ///     deliveries so the server can release replay entries;
+    ///   * on (re)connect, a `Resume(logical_session_id, [(stream,
+    ///     last_acked)])` frame is sent so the server re-sends any gap.
+    ///
+    /// Default `false` — backward compatible with existing ephemeral
+    /// traffic. See the server's reliability contract documentation for
+    /// the at-least-once guarantee and known limitations.
+    #[must_use]
+    pub fn reliable(mut self, enabled: bool) -> Self {
+        self.cfg.reliable = enabled;
+        self
+    }
+
+    /// Cumulative ACK cadence (only meaningful with [`reliable`](Self::reliable)).
+    /// Flush an `Ack` every `n` reliable deliveries. Default `32`.
+    #[must_use]
+    pub fn ack_interval(mut self, n: u8) -> Self {
+        self.cfg.ack_interval = n;
+        self
+    }
+
+    /// Override the logical session id used for Resume. The default (`0`)
+    /// makes the SDK allocate a random id on first connect; the same id
+    /// is then reused for every reconnect, so the server's replay window
+    /// remains keyed consistently across connection lifetimes.
+    #[must_use]
+    pub fn logical_session_id(mut self, id: u64) -> Self {
+        self.cfg.logical_session_id = id;
+        self
+    }
+
+    /// Seed per-stream cumulative-ACK watermarks from a prior session.
+    ///
+    /// Call this when creating a **new** `Client` to resume a previous
+    /// session (same `logical_session_id`). The first-connect `Resume`
+    /// carries these `(stream_id, last_acked_seq)` pairs so the server
+    /// replays the gap immediately, before any new subscriptions are
+    /// re-opened.
+    ///
+    /// Obtain the pairs from the prior client via
+    /// [`Client::snapshot_ack_state`](crate::Client::snapshot_ack_state)
+    /// before closing it.
+    #[must_use]
+    pub fn resume_state(mut self, state: Vec<(u64, u64)>) -> Self {
+        self.cfg.resume_state = state;
+        self
+    }
+
     /// Establish the QUIC connection and spawn the background I/O task.
     ///
     /// Returns once the TLS handshake completes and the ALPN protocol is
@@ -298,6 +382,7 @@ impl ClientBuilder {
         let pending_shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let notify_offset_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fetch_reply_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let duplicates_detected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Clone the sender into the task so it can embed it in StreamHandles.
         // The spawned task is detached: it exits when the last Client handle
         // drops (closing the command channel) or a Close command is received.
@@ -308,6 +393,7 @@ impl ClientBuilder {
             pending_shared.clone(),
             notify_offset_count.clone(),
             fetch_reply_count.clone(),
+            duplicates_detected.clone(),
             ready_tx,
         ));
         match ready_rx.await {
@@ -316,6 +402,7 @@ impl ClientBuilder {
                 pending_shared,
                 notify_offset_count,
                 fetch_reply_count,
+                duplicates_detected,
             )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(ConnectError::Closed(
