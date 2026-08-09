@@ -194,6 +194,21 @@ pub(crate) struct ClientConfig {
     /// replays the gap immediately. Default empty (first connect / no
     /// prior state).
     pub resume_state: Vec<(u64, u64)>,
+    /// Maximum total bytes buffered in [`Transport::pending`] across all
+    /// streams. When exceeded, `publish()` returns
+    /// [`PublishError::Backpressure`] (or retries if `publish_blocking`
+    /// is enabled). Protects the process from OOM under sustained
+    /// producer > consumer throughput. Default 256 MiB.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    pub pending_cap: usize,
+    /// When `true` (default), `publish()` uses `send().await` on the
+    /// command channel (blocks when the I/O task is behind). When
+    /// `false`, `publish()` uses `try_send` and returns
+    /// [`PublishError::NotConnected`] immediately when the channel is full.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    pub publish_blocking: bool,
 }
 
 /// Builder for a [`Client`].
@@ -236,6 +251,8 @@ impl ClientBuilder {
                 ack_interval: 32,
                 logical_session_id: 0,
                 resume_state: Vec::new(),
+                pending_cap: 256 * 1024 * 1024,
+                publish_blocking: true,
             },
         }
     }
@@ -367,6 +384,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum total bytes buffered in the transport's per-stream pending
+    /// map. When exceeded, `publish()` returns
+    /// [`PublishError::Backpressure`] (or retries if `publish_blocking`
+    /// is enabled). Default 256 MiB. Set lower for memory-constrained
+    /// apps or higher for bulk-throughput workloads.
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    #[must_use]
+    pub fn pending_cap(mut self, cap: usize) -> Self {
+        self.cfg.pending_cap = cap;
+        self
+    }
+
+    /// Controls whether `publish()` blocks (retries with backoff) or
+    /// returns immediately with [`PublishError::Backpressure`] when the
+    /// transport pending buffer is full. Default `true` (block).
+    ///
+    /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
+    #[must_use]
+    pub fn publish_blocking(mut self, enabled: bool) -> Self {
+        self.cfg.publish_blocking = enabled;
+        self
+    }
+
     /// Establish the QUIC connection and spawn the background I/O task.
     ///
     /// Returns once the TLS handshake completes and the ALPN protocol is
@@ -375,6 +416,7 @@ impl ClientBuilder {
     /// # Errors
     /// See [`ConnectError`].
     pub async fn connect(self) -> Result<Client, ConnectError> {
+        let publish_blocking = self.cfg.publish_blocking;
         let cfg = self.cfg;
         let cap = cfg.cmd_channel_cap.max(1);
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
@@ -403,6 +445,7 @@ impl ClientBuilder {
                 notify_offset_count,
                 fetch_reply_count,
                 duplicates_detected,
+                publish_blocking,
             )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(ConnectError::Closed(
