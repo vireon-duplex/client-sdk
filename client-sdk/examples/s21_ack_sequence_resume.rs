@@ -163,8 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Phase 2: disconnect the subscriber by dropping it ─────────────
     // The server's replay buffer retains entries for the logical session.
+    // Snapshot the per-stream ACK watermarks BEFORE closing so the new
+    // client can resume from the correct position.
     println!();
     println!("  \u{27f3} disconnecting subscriber (server retains replay window)\u{2026}");
+    let ack_state = sub.snapshot_ack_state().await.unwrap_or_default();
     // Abort collector + close subscriber — the server sees a conn-close.
     collector.abort();
     sub.close().await.ok();
@@ -192,6 +195,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Reuse the SAME logical_session_id so the server finds the
         // retained replay window for this session.
         .logical_session_id(LOGICAL_SESSION_ID)
+        // Seed the ACK watermarks from Phase 1 so the first-connect
+        // Resume carries (stream, last_acked) and the server replays
+        // only the gap.
+        .resume_state(ack_state)
         .reconnect(ReconnectPolicy {
             max_attempts: 20,
             initial_backoff: Duration::from_millis(150),
