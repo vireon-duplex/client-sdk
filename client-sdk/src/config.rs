@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::connection::Client;
 use crate::error::ConnectError;
+use quiche::CongestionControlAlgorithm;
 
 /// How the client validates the server's TLS certificate.
 ///
@@ -209,6 +210,20 @@ pub(crate) struct ClientConfig {
     ///
     /// [`PublishError::Backpressure`]: crate::PublishError::Backpressure
     pub publish_blocking: bool,
+    /// QUIC connection-level flow-control window (INITIAL_MAX_DATA).
+    /// Default 100 MiB.
+    pub max_data: u64,
+    /// QUIC per-stream flow-control window for bidirectional streams
+    /// (INITIAL_MAX_STREAM_DATA_BIDI_LOCAL / REMOTE). Default 10 MiB.
+    pub max_stream_data: u64,
+    /// Maximum number of concurrent bidirectional QUIC streams
+    /// (INITIAL_MAX_STREAMS_BIDI). Default 1024.
+    pub max_streams_bidi: u64,
+    /// Maximum number of concurrent unidirectional QUIC streams
+    /// (INITIAL_MAX_STREAMS_UNI). Default 1024.
+    pub max_streams_uni: u64,
+    /// QUIC congestion-control algorithm. Default CUBIC.
+    pub cc_algorithm: quiche::CongestionControlAlgorithm,
 }
 
 /// Builder for a [`Client`].
@@ -253,6 +268,11 @@ impl ClientBuilder {
                 resume_state: Vec::new(),
                 pending_cap: 256 * 1024 * 1024,
                 publish_blocking: true,
+                max_data: 100 * 1024 * 1024,
+                max_stream_data: 10 * 1024 * 1024,
+                max_streams_bidi: 1024,
+                max_streams_uni: 1024,
+                cc_algorithm: CongestionControlAlgorithm::CUBIC,
             },
         }
     }
@@ -405,6 +425,46 @@ impl ClientBuilder {
     #[must_use]
     pub fn publish_blocking(mut self, enabled: bool) -> Self {
         self.cfg.publish_blocking = enabled;
+        self
+    }
+
+    /// QUIC connection-level flow-control window
+    /// (INITIAL_MAX_DATA). Default 100 MiB. Increase for high-throughput
+    /// bulk-transfer workloads; decrease for memory-constrained clients.
+    #[must_use]
+    pub fn max_data(mut self, bytes: u64) -> Self {
+        self.cfg.max_data = bytes;
+        self
+    }
+
+    /// QUIC per-stream flow-control window for bidirectional streams.
+    /// Default 10 MiB. Applied to both local and remote bidi stream
+    /// limits.
+    #[must_use]
+    pub fn max_stream_data(mut self, bytes: u64) -> Self {
+        self.cfg.max_stream_data = bytes;
+        self
+    }
+
+    /// Maximum concurrent bidirectional QUIC streams. Default 1024.
+    #[must_use]
+    pub fn max_streams_bidi(mut self, count: u64) -> Self {
+        self.cfg.max_streams_bidi = count;
+        self
+    }
+
+    /// Maximum concurrent unidirectional QUIC streams. Default 1024.
+    #[must_use]
+    pub fn max_streams_uni(mut self, count: u64) -> Self {
+        self.cfg.max_streams_uni = count;
+        self
+    }
+
+    /// QUIC congestion-control algorithm. Default CUBIC. Use `Reno`
+    /// for low-bandwidth scenarios, `BBR` where available.
+    #[must_use]
+    pub fn congestion(mut self, algo: CongestionControlAlgorithm) -> Self {
+        self.cfg.cc_algorithm = algo;
         self
     }
 
