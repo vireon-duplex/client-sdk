@@ -187,6 +187,13 @@ pub(crate) struct ClientConfig {
     /// per-connection session id, which it reassigns on each connect).
     /// Default `0` → the SDK allocates a random id at first connect.
     pub logical_session_id: u64,
+    /// Per-stream `(stream_id, last_acked_seq)` pairs to seed the new
+    /// client's cumulative-ACK watermarks. Used when a fresh `Client` is
+    /// created to resume a PREVIOUS session (same `logical_session_id`)
+    /// — the first-connect `Resume` carries these slots so the server
+    /// replays the gap immediately. Default empty (first connect / no
+    /// prior state).
+    pub resume_state: Vec<(u64, u64)>,
 }
 
 /// Builder for a [`Client`].
@@ -228,6 +235,7 @@ impl ClientBuilder {
                 reliable: false,
                 ack_interval: 32,
                 logical_session_id: 0,
+                resume_state: Vec::new(),
             },
         }
     }
@@ -339,6 +347,23 @@ impl ClientBuilder {
     #[must_use]
     pub fn logical_session_id(mut self, id: u64) -> Self {
         self.cfg.logical_session_id = id;
+        self
+    }
+
+    /// Seed per-stream cumulative-ACK watermarks from a prior session.
+    ///
+    /// Call this when creating a **new** `Client` to resume a previous
+    /// session (same `logical_session_id`). The first-connect `Resume`
+    /// carries these `(stream_id, last_acked_seq)` pairs so the server
+    /// replays the gap immediately, before any new subscriptions are
+    /// re-opened.
+    ///
+    /// Obtain the pairs from the prior client via
+    /// [`Client::snapshot_ack_state`](crate::Client::snapshot_ack_state)
+    /// before closing it.
+    #[must_use]
+    pub fn resume_state(mut self, state: Vec<(u64, u64)>) -> Self {
+        self.cfg.resume_state = state;
         self
     }
 
