@@ -71,6 +71,11 @@ pub(crate) struct Transport {
     /// Reusable encode buffer for `send_frame`. Avoids a `BytesMut::with_capacity`
     /// allocation per frame — cleared and re-filled each call.
     encode_buf: BytesMut,
+    /// Maximum total bytes allowed in `pending` across all streams. When
+    /// exceeded, `stream_send` returns [`ConnectError::TransportFull`] so
+    /// the caller can apply backpressure to the producer instead of
+    /// buffering indefinitely. `usize::MAX` disables (unsafe — can OOM).
+    pending_cap: usize,
 }
 
 impl Transport {
@@ -103,8 +108,16 @@ impl Transport {
         // lookups on the hot path) and so ICMP errors surface on recv.
         sock.connect(peer).await?;
 
-        let mut qcfg =
-            build_quiche_config(&cfg.tls, cfg.idle_timeout, cfg.client_identity.as_ref())?;
+        let mut qcfg = build_quiche_config(
+            &cfg.tls,
+            cfg.idle_timeout,
+            cfg.client_identity.as_ref(),
+            cfg.max_data,
+            cfg.max_stream_data,
+            cfg.max_streams_bidi,
+            cfg.max_streams_uni,
+            cfg.cc_algorithm,
+        )?;
         let scid = quiche::ConnectionId::from_vec(gen_scid());
         let mut conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut qcfg)?;
 
@@ -125,6 +138,7 @@ impl Transport {
             pending: HashMap::new(),
             pending_shared: Arc::new(AtomicUsize::new(0)),
             encode_buf: BytesMut::new(),
+            pending_cap: cfg.pending_cap,
         };
 
         t.handshake().await?;
@@ -312,6 +326,17 @@ impl Transport {
     /// silent frame-truncation that caused server-side `CrcMismatch` and
     /// decoder desync.
     fn stream_send(&mut self, stream_id: u64, data: &[u8]) -> Result<(), ConnectError> {
+        // Pending-buffer cap: if buffering this frame's tail would push
+        // total pending bytes over the configured limit, reject the write
+        // with TransportFull so the caller applies backpressure to the
+        // producer instead of letting the process OOM.
+        let current_pending = self.pending_bytes();
+        let projected = current_pending.saturating_add(data.len());
+        if projected > self.pending_cap {
+            self.sync_pending_shared();
+            return Err(ConnectError::TransportFull);
+        }
+
         // If there's already pending data for this stream, append to it.
         // The new data must go AFTER the buffered tail to preserve byte
         // ordering on the stream.
@@ -608,6 +633,11 @@ fn build_quiche_config(
     tls: &TlsVerify,
     idle_timeout: Duration,
     client_identity: Option<&ClientIdentity>,
+    max_data: u64,
+    max_stream_data: u64,
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    cc_algorithm: quiche::CongestionControlAlgorithm,
 ) -> Result<quiche::Config, ConnectError> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.set_application_protos(&[ALPN])?;
@@ -637,17 +667,17 @@ fn build_quiche_config(
     config.set_max_idle_timeout(idle_ms);
     config.set_max_recv_udp_payload_size(DGRAM_BUF);
     config.set_max_send_udp_payload_size(DGRAM_BUF);
-    config.set_initial_max_data(100 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_local(10 * 1024 * 1024);
-    config.set_initial_max_stream_data_bidi_remote(10 * 1024 * 1024);
-    config.set_initial_max_stream_data_uni(10 * 1024 * 1024);
-    config.set_initial_max_streams_bidi(1024);
-    config.set_initial_max_streams_uni(1024);
+    config.set_initial_max_data(max_data);
+    config.set_initial_max_stream_data_bidi_local(max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(max_stream_data);
+    config.set_initial_max_stream_data_uni(max_stream_data);
+    config.set_initial_max_streams_bidi(max_streams_bidi);
+    config.set_initial_max_streams_uni(max_streams_uni);
     config.set_disable_active_migration(false);
     // Enable session resumption (0-RTT early data on reconnect).
     config.enable_early_data();
     config.discover_pmtu(false);
-    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
+    config.set_cc_algorithm(cc_algorithm);
 
     // ── TLS verification ────────────────────────────────────────────
     // quiche 0.22 exposes verify_peer + CA-file loading via Config. A true
