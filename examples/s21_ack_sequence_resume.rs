@@ -61,7 +61,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = ephemeral_port().expect("port");
     let addr = format!("127.0.0.1:{port}");
 
-    let _server = ServerGuard::start(port, &cert, &key).expect("server");
+    // Honour VIREON_WORKERS so the matrix script can sweep single/multi.
+    // Default 1 (single-worker — the guaranteed resume path).
+    let workers = std::env::var("VIREON_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let _server = if workers > 1 {
+        ServerGuard::start_with(
+            port,
+            &cert,
+            &key,
+            &["--workers", &workers.to_string(), "--mode", "multi"],
+        )
+        .expect("server")
+    } else {
+        ServerGuard::start(port, &cert, &key).expect("server")
+    };
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     print_header(
