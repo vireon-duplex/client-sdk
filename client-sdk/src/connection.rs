@@ -146,6 +146,11 @@ pub(crate) enum ConnCmd {
         bind_addr: String,
         resp: oneshot::Sender<Result<(), ConnectError>>,
     },
+    /// Snapshot the per-stream cumulative-ACK watermarks so a new Client
+    /// can resume the same logical session (see `ClientBuilder::resume_state`).
+    SnapshotAckState {
+        resp: oneshot::Sender<Vec<(u64, u64)>>,
+    },
 }
 
 /// A cloneable handle to a Vireon connection.
@@ -232,6 +237,24 @@ impl Client {
     pub fn duplicates_detected(&self) -> u64 {
         self.duplicates_detected
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot the per-stream `(stream_id, last_acked_seq)` cumulative-ACK
+    /// watermarks. Pass the result to
+    /// [`ClientBuilder::resume_state`](crate::ClientBuilder::resume_state)
+    /// on a **new** client (with the same `logical_session_id`) so its
+    /// first-connect `Resume` carries the correct ack position and the
+    /// server replays only the gap.
+    ///
+    /// # Errors
+    /// [`ConnectError::NotConnected`] if the connection task has exited.
+    pub async fn snapshot_ack_state(&self) -> Result<Vec<(u64, u64)>, ConnectError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(ConnCmd::SnapshotAckState { resp: resp_tx })
+            .await
+            .map_err(|_| ConnectError::Closed("connection task exited".into()))?;
+        resp_rx.await.map_err(|_| ConnectError::Closed("connection task exited".into()))
     }
 
     /// Subscribe to a topic pattern on the default channel.
@@ -749,7 +772,16 @@ impl TaskState {
         reliable_enabled: bool,
         ack_interval_msgs: u8,
         logical_session_id: u64,
+        resume_state: Vec<(u64, u64)>,
     ) -> Self {
+        // Seed the cumulative-ACK watermarks from the prior session so
+        // the first-connect Resume carries the correct last_acked per
+        // stream and the server replays only the gap.
+        let pending_acks: HashMap<u64, u64> = resume_state.into_iter().collect();
+        // highest_accepted mirrors pending_acks so that replayed frames
+        // below the watermark are dedup'd (shouldn't happen if the server
+        // respects last_acked, but defensive).
+        let highest_accepted = pending_acks.clone();
         Self {
             subs: Vec::new(),
             streams: HashMap::new(),
@@ -771,8 +803,8 @@ impl TaskState {
             reliable_enabled,
             ack_interval_msgs,
             logical_session_id,
-            highest_accepted: HashMap::new(),
-            pending_acks: HashMap::new(),
+            highest_accepted,
+            pending_acks,
             reliable_since_flush: HashMap::new(),
             pending_ack_flush: Vec::new(),
             duplicates_detected,
@@ -1162,6 +1194,15 @@ impl TaskState {
                     let _ = transport.flush();
                 }
                 let _ = resp.send(result);
+                false
+            }
+            ConnCmd::SnapshotAckState { resp } => {
+                let snapshot: Vec<(u64, u64)> = self
+                    .pending_acks
+                    .iter()
+                    .map(|(&s, &a)| (s, a))
+                    .collect();
+                let _ = resp.send(snapshot);
                 false
             }
         }
@@ -1626,26 +1667,37 @@ pub(crate) async fn run(
                 .unwrap_or(0)
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         },
+        cfg.resume_state.clone(),
     );
 
-    // ── First-connect session hello ───────────────────────────────────
+    // ── First-connect Resume (session hello or gap-replay) ────────────
     //
-    // When reliability is enabled, send an empty Resume (session hello)
-    // immediately after the handshake so the server registers the logical
-    // session and allocates a replay window for it. Subsequent subscribes
-    // then bind streams into that window. On reconnect, replay_all sends
-    // a full Resume with the per-stream last-acked watermarks.
+    // When reliability is enabled, send a Resume immediately after the
+    // handshake. If pending_acks is non-empty (seeded from a prior
+    // session via ClientBuilder::resume_state), the Resume carries those
+    // (stream_id, last_acked) slots and the server replays the gap.
+    // Otherwise it's a session hello (0 slots) that just registers the
+    // logical session.
     if state.reliable_enabled {
-        let mut hello = Vec::with_capacity(9);
-        hello.extend_from_slice(&state.logical_session_id.to_be_bytes());
-        hello.push(0); // zero slots — session hello
+        let slots: Vec<(u64, u64)> = state
+            .pending_acks
+            .iter()
+            .map(|(&s, &a)| (s, a))
+            .collect();
+        let mut buf = Vec::with_capacity(9 + slots.len() * 16);
+        buf.extend_from_slice(&state.logical_session_id.to_be_bytes());
+        buf.push(slots.len().min(u8::MAX as usize) as u8);
+        for &(sid, ack) in &slots {
+            buf.extend_from_slice(&sid.to_be_bytes());
+            buf.extend_from_slice(&ack.to_be_bytes());
+        }
         let header = FrameHeader::new(
             StreamId::new(DEFAULT_STREAM),
             MessageType::Resume,
         )
         .with_seq(state.next_seq(DEFAULT_STREAM));
-        if let Err(e) = transport.send_frame(header, &hello, DEFAULT_STREAM) {
-            tracing::warn!(error = %e, "[client] session-hello Resume send failed");
+        if let Err(e) = transport.send_frame(header, &buf, DEFAULT_STREAM) {
+            tracing::warn!(error = %e, "[client] first-connect Resume send failed");
         }
         let _ = transport.flush();
     }
@@ -1957,6 +2009,10 @@ fn fail_cmd_not_connected(cmd: ConnCmd) {
                 "migrate requested during reconnect backoff".into(),
             )));
         }
+        ConnCmd::SnapshotAckState { resp } => {
+            // Nothing to snapshot — return empty.
+            let _ = resp.send(Vec::new());
+        }
     }
 }
 
@@ -2180,7 +2236,7 @@ mod tests {
         let notify = Arc::new(AtomicU64::new(0));
         let fetch = Arc::new(AtomicU64::new(0));
         let dups = Arc::new(AtomicU64::new(0));
-        TaskState::new(8, 1024 * 1024, tx, pending, notify, fetch, dups, false, 32, 0)
+        TaskState::new(8, 1024 * 1024, tx, pending, notify, fetch, dups, false, 32, 0, Vec::new())
     }
 
     fn make_publish_frame(topic: &str, body: &[u8]) -> frame::codec::Frame {
@@ -2229,6 +2285,7 @@ mod tests {
             true,
             ack_interval,
             42, // logical session id (deterministic for tests)
+            Vec::new(), // no prior-session resume state
         )
     }
 
