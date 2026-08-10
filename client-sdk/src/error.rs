@@ -108,6 +108,10 @@ pub enum StreamError {
     /// The connection is no longer usable.
     #[error("not connected")]
     NotConnected,
+
+    /// The stream or connection has been closed.
+    #[error("closed")]
+    Closed,
 }
 
 /// Failure to join / leave a consumer group.
