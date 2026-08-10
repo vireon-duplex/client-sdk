@@ -18,8 +18,60 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::DeliveryPolicy;
 use crate::connection::{ConnCmd, StreamSel};
-use crate::error::PublishError;
+use crate::error::{PublishError, StreamError};
 use crate::message::Message;
+
+/// Content category for a dedicated stream.
+///
+/// Each variant maps to a sensible default [`DeliveryPolicy`] — call
+/// `conn.open_stream(StreamType::Audio).await?` for the common case,
+/// or build a full [`StreamSpec`] when you need fine-grained control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamType {
+    /// Realtime audio — latency-sensitive, stale samples are useless.
+    /// Default policy: [`DeliveryPolicy::RealtimeDropOld`].
+    Audio,
+    /// Realtime video — same reasoning as audio.
+    /// Default policy: [`DeliveryPolicy::RealtimeDropOld`].
+    Video,
+    /// Chat / text — messages must arrive in order and complete.
+    /// Default policy: [`DeliveryPolicy::ReliableOrdered`].
+    Text,
+    /// State mutations / presence / config — must not be lost.
+    /// Default policy: [`DeliveryPolicy::ReliableOrdered`].
+    Event,
+    /// AI token streams / LLM responses — ordered, lossless.
+    /// Default policy: [`DeliveryPolicy::ReliableOrdered`].
+    Ai,
+    /// Bulk file transfer — ordered not required, lossless.
+    /// Default policy: [`DeliveryPolicy::ReliableUnordered`].
+    File,
+    /// User-defined — caller sets the policy explicitly.
+    /// Default policy: [`DeliveryPolicy::ReliableOrdered`].
+    Custom,
+}
+
+impl StreamType {
+    /// Returns the default [`DeliveryPolicy`] for this stream type.
+    #[inline]
+    #[must_use]
+    pub const fn default_policy(self) -> DeliveryPolicy {
+        match self {
+            Self::Audio | Self::Video => DeliveryPolicy::RealtimeDropOld,
+            Self::Text | Self::Event | Self::Ai | Self::Custom => DeliveryPolicy::ReliableOrdered,
+            Self::File => DeliveryPolicy::ReliableUnordered,
+        }
+    }
+}
+
+/// `conn.open_stream(StreamType::Audio)` — uses the type's default policy.
+impl From<StreamType> for StreamSpec {
+    #[inline]
+    fn from(t: StreamType) -> Self {
+        Self::new(t.default_policy())
+    }
+}
 
 /// Specification for a dedicated stream.
 ///
@@ -32,6 +84,9 @@ pub struct StreamSpec {
     pub policy: DeliveryPolicy,
     /// Optional single topic to subscribe on this stream (`None` ⇒ `"*"`).
     pub topic: Option<String>,
+    /// Content category — informational only, does not affect the wire
+    /// protocol (policy is what the server uses). Defaults to `Custom`.
+    pub stream_type: StreamType,
 }
 
 impl StreamSpec {
@@ -41,6 +96,17 @@ impl StreamSpec {
         Self {
             policy,
             topic: None,
+            stream_type: StreamType::Custom,
+        }
+    }
+
+    /// Create a spec from a [`StreamType`], using its default policy.
+    #[must_use]
+    pub fn typed(stream_type: StreamType) -> Self {
+        Self {
+            policy: stream_type.default_policy(),
+            topic: None,
+            stream_type,
         }
     }
 
@@ -184,5 +250,83 @@ impl StreamHandle {
                 resp: resp_tx,
             })
             .map_err(|_| PublishError::NotConnected)
+    }
+
+    /// Gracefully close this stream. Consumes `self` — the handle is no
+    /// longer usable after closing. Sends a `StreamClose` frame so the
+    /// server tears down its per-stream state immediately.
+    ///
+    /// This is also called automatically on `Drop`, but calling `close()`
+    /// explicitly lets you observe errors.
+    pub async fn close(self) -> Result<(), StreamError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::CloseStream {
+            stream_id: self.stream_id,
+            resp: resp_tx,
+        };
+        let _ = self.cmd_tx.send(cmd).await;
+        // Mark as closed so Drop doesn't double-send.
+        std::mem::forget(self);
+        resp_rx.await.map_err(|_| StreamError::Closed)?
+    }
+
+    /// Abruptly reset this stream with a reason code. The server tears
+    /// down its per-stream send policy. The handle remains usable for
+    /// receiving any already-buffered messages.
+    pub async fn reset(&self, reason: u32) -> Result<(), StreamError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::ResetStream {
+            stream_id: self.stream_id,
+            reason,
+            resp: resp_tx,
+        };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| StreamError::Closed)?;
+        resp_rx.await.map_err(|_| StreamError::Closed)?
+    }
+
+    /// Pause delivery on this stream. The server stops sending new frames
+    /// but keeps buffering for reliable streams (the gap is replayed on
+    /// resume). For realtime streams, frames during pause are dropped.
+    pub async fn pause(&self) -> Result<(), StreamError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::PauseStream {
+            stream_id: self.stream_id,
+            resp: resp_tx,
+        };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| StreamError::Closed)?;
+        resp_rx.await.map_err(|_| StreamError::Closed)?
+    }
+
+    /// Resume delivery on a previously-paused stream. Reliable streams
+    /// receive the buffered gap; realtime streams resume from now.
+    pub async fn resume(&self) -> Result<(), StreamError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = ConnCmd::ResumeStream {
+            stream_id: self.stream_id,
+            resp: resp_tx,
+        };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| StreamError::Closed)?;
+        resp_rx.await.map_err(|_| StreamError::Closed)?
+    }
+}
+
+/// On drop, fire-and-forget a `StreamClose` so the server cleans up
+/// even if the caller forgets to call [`StreamHandle::close`].
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let _ = self.cmd_tx.try_send(ConnCmd::CloseStream {
+            stream_id: self.stream_id,
+            resp: resp_tx,
+        });
     }
 }

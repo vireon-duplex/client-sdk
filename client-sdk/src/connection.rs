@@ -102,6 +102,27 @@ pub(crate) enum ConnCmd {
         spec: StreamSpec,
         resp: oneshot::Sender<Result<StreamHandle, StreamError>>,
     },
+    /// Gracefully close a dedicated stream (send StreamClose).
+    CloseStream {
+        stream_id: u64,
+        resp: oneshot::Sender<Result<(), StreamError>>,
+    },
+    /// Abruptly reset a stream with a reason code.
+    ResetStream {
+        stream_id: u64,
+        reason: u32,
+        resp: oneshot::Sender<Result<(), StreamError>>,
+    },
+    /// Pause delivery on a stream.
+    PauseStream {
+        stream_id: u64,
+        resp: oneshot::Sender<Result<(), StreamError>>,
+    },
+    /// Resume delivery on a stream.
+    ResumeStream {
+        stream_id: u64,
+        resp: oneshot::Sender<Result<(), StreamError>>,
+    },
     /// Register a pending RPC reply handler.
     ///
     /// The connection task (1) lazily subscribes to `reply_topic` if not
@@ -1116,6 +1137,43 @@ impl TaskState {
                 let _ = resp.send(out);
                 false
             }
+            ConnCmd::CloseStream { stream_id, resp } => {
+                let out = self
+                    .send_lifecycle_frame(transport, stream_id, MessageType::StreamClose, &[])
+                    .map_err(|_| StreamError::NotConnected);
+                let _ = resp.send(out);
+                false
+            }
+            ConnCmd::ResetStream {
+                stream_id,
+                reason,
+                resp,
+            } => {
+                let out = self
+                    .send_lifecycle_frame(
+                        transport,
+                        stream_id,
+                        MessageType::StreamReset,
+                        &reason.to_be_bytes(),
+                    )
+                    .map_err(|_| StreamError::NotConnected);
+                let _ = resp.send(out);
+                false
+            }
+            ConnCmd::PauseStream { stream_id, resp } => {
+                let out = self
+                    .send_lifecycle_frame(transport, stream_id, MessageType::StreamPause, &[])
+                    .map_err(|_| StreamError::NotConnected);
+                let _ = resp.send(out);
+                false
+            }
+            ConnCmd::ResumeStream { stream_id, resp } => {
+                let out = self
+                    .send_lifecycle_frame(transport, stream_id, MessageType::StreamResume, &[])
+                    .map_err(|_| StreamError::NotConnected);
+                let _ = resp.send(out);
+                false
+            }
             ConnCmd::RegisterRpcReply {
                 cid,
                 reply_topic,
@@ -1328,6 +1386,28 @@ impl TaskState {
             self.cmd_tx.clone(),
             self.pending_shared.clone(),
         ))
+    }
+
+    /// Sends a stream-lifecycle control frame (StreamClose / StreamReset /
+    /// StreamPause / StreamResume) on the given dedicated stream. Used by
+    /// the `close`, `reset`, `pause`, `resume` methods on `StreamHandle`.
+    fn send_lifecycle_frame(
+        &mut self,
+        transport: &mut Transport,
+        stream_id: u64,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<(), ConnectError> {
+        let header = FrameHeader::new(StreamId::new(stream_id), msg_type)
+            .with_seq(self.next_seq(stream_id));
+        self.encode_and_send_raw(header, payload, stream_id, transport)?;
+        transport.flush()?;
+        // Clean up local routing for close/reset so the receiver channel
+        // drains and closes naturally.
+        if matches!(msg_type, MessageType::StreamClose | MessageType::StreamReset) {
+            self.streams.remove(&stream_id);
+        }
+        Ok(())
     }
 
     /// Open a dedicated stream, send `ConsumerGroupJoin`, and register the
@@ -1998,6 +2078,12 @@ fn fail_cmd_not_connected(cmd: ConnCmd) {
             let _ = resp.send(Err(SubscribeError::NotConnected));
         }
         ConnCmd::OpenStream { resp, .. } => {
+            let _ = resp.send(Err(StreamError::NotConnected));
+        }
+        ConnCmd::CloseStream { resp, .. }
+        | ConnCmd::ResetStream { resp, .. }
+        | ConnCmd::PauseStream { resp, .. }
+        | ConnCmd::ResumeStream { resp, .. } => {
             let _ = resp.send(Err(StreamError::NotConnected));
         }
         ConnCmd::RegisterRpcReply { resp, .. } => {
