@@ -68,3 +68,8 @@ pub use stream::{StreamHandle, StreamSpec, StreamType};
 /// byte stays defined in exactly one place (the same byte the server decodes
 /// on `StreamOpen`).
 pub use send_policy::DeliveryPolicy;
+
+/// Per-stream egress priority — re-exported from `send_policy`. Decoupled
+/// from `DeliveryPolicy` so a caller can mark an audio stream `Critical`
+/// and a file-sync stream `Low` independently of their delivery policies.
+pub use send_policy::StreamPriority;
