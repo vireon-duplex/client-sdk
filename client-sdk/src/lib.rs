@@ -62,7 +62,7 @@ pub use error::{
 pub use message::{Message, Payload, Qos};
 pub use pool::ClientPool;
 pub use pubsub::{GroupSubscription, Subscription};
-pub use stream::{StreamHandle, StreamSpec};
+pub use stream::{StreamHandle, StreamSpec, StreamType};
 
 /// Per-stream delivery semantics — re-exported from `send_policy` so the wire
 /// byte stays defined in exactly one place (the same byte the server decodes
