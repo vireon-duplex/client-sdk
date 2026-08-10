@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use frame::codec::FrameHeader;
 use frame::header::{FrameFlags, MessageType, Seq, StreamId};
-use send_policy::StreamOpenMeta;
+use send_policy::{StreamOpenMeta, StreamPriority};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::DeliveryPolicy;
@@ -788,6 +788,7 @@ struct SubEntry {
 /// One dedicated-stream registration, retained for reconnect replay.
 struct StreamEntry {
     policy: DeliveryPolicy,
+    priority: StreamPriority,
     topic: Option<String>,
     tx: mpsc::Sender<Message>,
 }
@@ -1354,6 +1355,7 @@ impl TaskState {
             sid,
             StreamEntry {
                 policy: spec.policy,
+                priority: spec.priority,
                 topic: spec.topic.clone(),
                 tx,
             },
@@ -1363,7 +1365,7 @@ impl TaskState {
         //    MUST be the `StreamOpenMeta` byte — the server decodes exactly
         //    this byte. Do NOT use frame::payload::StreamOpen (different
         //    encoding: a direction byte the server ignores).
-        let policy_bytes = StreamOpenMeta::new(spec.policy).encode();
+        let policy_bytes = StreamOpenMeta::new(spec.policy, spec.priority).encode();
         let header = FrameHeader::new(StreamId::new(sid), MessageType::StreamOpen)
             .with_seq(self.next_seq(sid));
         self.encode_and_send_raw(header, &policy_bytes, sid, transport)
@@ -1437,6 +1439,7 @@ impl TaskState {
             sid,
             StreamEntry {
                 policy: DeliveryPolicy::ReliableOrdered,
+                priority: StreamPriority::Normal,
                 topic: Some(topic.to_string()),
                 tx,
             },
@@ -1448,7 +1451,8 @@ impl TaskState {
         // Without Subscribe, the server has no `Subscriber` entry in
         // `pubsub_registry` — `route_publish` finds zero local targets
         // and the publish is dropped before reaching `group_locals`.
-        let policy_bytes = StreamOpenMeta::new(DeliveryPolicy::ReliableOrdered).encode();
+        let policy_bytes =
+            StreamOpenMeta::new(DeliveryPolicy::ReliableOrdered, StreamPriority::Normal).encode();
         let so_header = FrameHeader::new(StreamId::new(sid), MessageType::StreamOpen)
             .with_seq(self.next_seq(sid));
         self.encode_and_send_raw(so_header, &policy_bytes, sid, transport)
@@ -1599,10 +1603,10 @@ impl TaskState {
             .iter()
             .map(|s| (s.pattern.clone(), s.qos))
             .collect();
-        let stream_replay: Vec<(u64, DeliveryPolicy, Option<String>)> = self
+        let stream_replay: Vec<(u64, DeliveryPolicy, StreamPriority, Option<String>)> = self
             .streams
             .iter()
-            .map(|(sid, e)| (*sid, e.policy, e.topic.clone()))
+            .map(|(sid, e)| (*sid, e.policy, e.priority, e.topic.clone()))
             .collect();
 
         // Default-channel subscriptions.
@@ -1620,9 +1624,9 @@ impl TaskState {
             }
         }
 
-        // Dedicated streams: StreamOpen (policy byte) + Subscribe.
-        for (sid, policy, topic) in &stream_replay {
-            let policy_bytes = StreamOpenMeta::new(*policy).encode();
+        // Dedicated streams: StreamOpen (policy + priority bytes) + Subscribe.
+        for (sid, policy, priority, topic) in &stream_replay {
+            let policy_bytes = StreamOpenMeta::new(*policy, *priority).encode();
             let h1 = FrameHeader::new(StreamId::new(*sid), MessageType::StreamOpen)
                 .with_seq(self.next_seq(*sid));
             if let Err(e) = transport.send_frame(h1, &policy_bytes, *sid) {
@@ -2400,6 +2404,7 @@ mod tests {
             7,
             StreamEntry {
                 policy: DeliveryPolicy::ReliableUnordered,
+                priority: StreamPriority::Normal,
                 topic: Some("sensor.temp".into()),
                 tx: stx,
             },
@@ -2423,6 +2428,7 @@ mod tests {
             7,
             StreamEntry {
                 policy: DeliveryPolicy::ReliableUnordered,
+                priority: StreamPriority::Normal,
                 topic: Some("sensor.temp".into()),
                 tx: stx,
             },
@@ -2454,6 +2460,7 @@ mod tests {
             7,
             StreamEntry {
                 policy: DeliveryPolicy::ReliableUnordered,
+                priority: StreamPriority::Normal,
                 topic: Some("sensor.temp".into()),
                 tx: stx,
             },
@@ -2499,6 +2506,7 @@ mod tests {
             7,
             StreamEntry {
                 policy: DeliveryPolicy::ReliableUnordered,
+                priority: StreamPriority::Normal,
                 topic: Some("sensor.temp".into()),
                 tx: stx,
             },

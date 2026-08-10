@@ -17,6 +17,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::DeliveryPolicy;
+use crate::StreamPriority;
 use crate::connection::{ConnCmd, StreamSel};
 use crate::error::{PublishError, StreamError};
 use crate::message::Message;
@@ -63,13 +64,36 @@ impl StreamType {
             Self::File => DeliveryPolicy::ReliableUnordered,
         }
     }
+
+    /// Returns the default [`StreamPriority`] for this stream type.
+    ///
+    /// Decoupled from [`default_policy`](Self::default_policy): a `Text`
+    /// stream and an `Ai` stream share `ReliableOrdered` policy but may
+    /// still differ in urgency. Callers can override via
+    /// [`StreamSpec::with_priority`].
+    #[inline]
+    #[must_use]
+    pub const fn default_priority(self) -> StreamPriority {
+        match self {
+            Self::Audio => StreamPriority::Critical,
+            Self::Video | Self::Event => StreamPriority::High,
+            Self::Text | Self::Ai | Self::Custom => StreamPriority::Normal,
+            Self::File => StreamPriority::Low,
+        }
+    }
 }
 
-/// `conn.open_stream(StreamType::Audio)` — uses the type's default policy.
+/// `conn.open_stream(StreamType::Audio)` — uses the type's default policy
+/// and priority.
 impl From<StreamType> for StreamSpec {
     #[inline]
     fn from(t: StreamType) -> Self {
-        Self::new(t.default_policy())
+        Self {
+            policy: t.default_policy(),
+            priority: t.default_priority(),
+            topic: None,
+            stream_type: t,
+        }
     }
 }
 
@@ -82,6 +106,10 @@ impl From<StreamType> for StreamSpec {
 pub struct StreamSpec {
     /// Per-stream egress policy declared to the server at `StreamOpen` time.
     pub policy: DeliveryPolicy,
+    /// Per-stream egress priority declared to the server at `StreamOpen`
+    /// time. Decoupled from `policy` — a Critical audio stream and a Low
+    /// file-sync stream may share a realtime policy or diverge freely.
+    pub priority: StreamPriority,
     /// Optional single topic to subscribe on this stream (`None` ⇒ `"*"`).
     pub topic: Option<String>,
     /// Content category — informational only, does not affect the wire
@@ -90,21 +118,25 @@ pub struct StreamSpec {
 }
 
 impl StreamSpec {
-    /// Create a spec with the given policy and a catch-all subscription.
+    /// Create a spec with the given policy, a catch-all subscription, and
+    /// the default priority ([`StreamPriority::Normal`]).
     #[must_use]
     pub fn new(policy: DeliveryPolicy) -> Self {
         Self {
             policy,
+            priority: StreamPriority::Normal,
             topic: None,
             stream_type: StreamType::Custom,
         }
     }
 
-    /// Create a spec from a [`StreamType`], using its default policy.
+    /// Create a spec from a [`StreamType`], using its default policy and
+    /// default priority.
     #[must_use]
     pub fn typed(stream_type: StreamType) -> Self {
         Self {
             policy: stream_type.default_policy(),
+            priority: stream_type.default_priority(),
             topic: None,
             stream_type,
         }
@@ -114,6 +146,15 @@ impl StreamSpec {
     #[must_use]
     pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
         self.topic = Some(topic.into());
+        self
+    }
+
+    /// Override the egress priority. By default the priority comes from
+    /// the [`StreamType`] (see [`StreamType::default_priority`]); use this
+    /// to promote or demote an individual stream.
+    #[must_use]
+    pub fn with_priority(mut self, priority: StreamPriority) -> Self {
+        self.priority = priority;
         self
     }
 }
