@@ -40,6 +40,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## CLI tool
+
+A redis-cli-style binary — **`vireon`** — wraps this SDK for manual
+testing and operations. See [`vireon-cli/README.md`](https://github.com/vireon-duplex/vireon)
+for the full surface; highlights:
+
+```text
+vireon ping                              # health check (connect RTT)
+vireon pub sensor.temp "23.5C"           # one-shot publish
+vireon sub "sensor.*" --format json      # tail matching messages
+vireon stream pub video.frame f.bin --policy latest_only
+vireon group sub jobs.tasks workers worker-1
+```
+
+The `mux` subcommand showcases Vireon's headline differentiator — many
+streams with independent delivery policies multiplexed on ONE QUIC
+connection:
+
+```text
+vireon mux sub \
+  --stream video=video.frame:latest_only \
+  --stream audio=audio.frame:realtime_drop_old \
+  --stream chat=chat.msg:reliable_ordered
+# listening on 3 streams over 1 connection — Ctrl+C to exit
+```
+
+Build + install:
+
+```text
+cargo build --release -p vireon-cli
+sudo ./scripts/install.sh        # installs both quic-server and vireon
+```
+
 ## Why this SDK exists
 
 Vireon's differentiator is **per-stream delivery semantics with real
