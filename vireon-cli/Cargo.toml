@@ -27,5 +27,8 @@ tracing = { workspace = true }
 # Byte payloads.
 bytes = { workspace = true }
 
+# Typed errors for the public CLI surface (mirrors client-sdk).
+thiserror = { workspace = true }
+
 [lints]
 workspace = true
