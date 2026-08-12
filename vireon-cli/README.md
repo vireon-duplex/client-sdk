@@ -7,19 +7,69 @@ operations, and ad-hoc inspection. Built on
 
 ## Install
 
-System install (alongside the server):
+### Option 1 — System install (systemd)
+
+Build and install alongside the server. The install script installs the
+server binary, the CLI binary, and a systemd template for long-running
+subscribers:
 
 ```text
-cargo build --release -p vireon-cli
-sudo ./scripts/install.sh        # installs both quic-server and vireon
+cargo build --release -p quic-server -p vireon-cli
+sudo ./scripts/install.sh
 ```
 
-Or run the binary directly from the build directory:
+After install:
+
+```text
+vireon ping                                    # CLI on PATH (/usr/local/bin/)
+sudo systemctl enable --now vireon             # start server
+```
+
+**Long-running subscribers** — the template unit `vireon-sub@.service`
+runs `vireon sub` as a daemon, driven by an env-file:
+
+```text
+sudo cp /etc/vireon/subscribers/example.conf /etc/vireon/subscribers/logging.conf
+sudoedit /etc/vireon/subscribers/logging.conf   # set PATTERN, FORMAT
+sudo systemctl enable --now vireon-sub@logging  # start named instance
+journalctl -u vireon-sub@logging -f             # tail output
+```
+
+### Option 2 — Docker
+
+The server image bundles the CLI at `/usr/local/bin/vireon`. Use `docker
+exec` against a running server, or `docker compose run` for one-shot
+commands:
+
+```text
+# If the server is already running via docker compose:
+docker compose up -d vireon
+docker compose exec vireon vireon ping
+
+# Or run the CLI as a one-shot container:
+docker compose run --rm cli ping
+docker compose run --rm cli sub "sensor.*" --count 10
+docker compose run --rm cli pub sensor.temp "23.5C"
+docker compose run --rm cli mux sub --stream video=video.frame:latest_only
+```
+
+The `cli` service is profile-gated — it does **not** start with
+`docker compose up`, only when explicitly invoked. It auto-connects to
+the server service via the compose network
+(`VIREON_ADDR=vireon:4433`).
+
+### Option 3 — Build from source (no install)
 
 ```text
 cargo build --release -p vireon-cli
 ./target/release/vireon ping
 ```
+
+### Prebuilt binary
+
+Release builds are attached to every GitHub Release as
+`vireon-linux-amd64` — see the [Releases
+page](https://github.com/vireon-duplex/vireon/releases).
 
 ## Usage
 

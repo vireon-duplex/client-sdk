@@ -93,9 +93,17 @@ impl Transport {
         cfg: &ClientConfig,
         session: Option<&[u8]>,
     ) -> Result<Self, ConnectError> {
-        let peer: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
-            .parse()
-            .map_err(|e| ConnectError::Config(format!("invalid server address: {e}")))?;
+        // Resolve the address — supports both IP literals (127.0.0.1:4433)
+        // and hostnames (vireon.example.com:4433, Docker compose service
+        // names). tokio::net::lookup_host is async DNS.
+        let addr_string = format!("{}:{}", cfg.host, cfg.port);
+        let peer: SocketAddr = tokio::net::lookup_host(&addr_string)
+            .await
+            .map_err(|e| ConnectError::Config(format!("failed to resolve '{addr_string}': {e}")))?
+            .next()
+            .ok_or_else(|| {
+                ConnectError::Config(format!("no addresses resolved for '{addr_string}'"))
+            })?;
 
         let bind_addr = if peer.is_ipv6() {
             "[::]:0"
