@@ -1,0 +1,40 @@
+[Unit]
+Description=Vireon QUIC-native Pub/Sub Server
+Documentation=https://github.com/vireon-duplex/vireon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vireon
+Group=vireon
+
+ExecStart=/usr/local/bin/quic-server --config /etc/vireon/vireon.conf
+Restart=on-failure
+RestartSec=2
+
+# ── Resource limits ───────────────────────────────────────────────────
+# io_uring registered buffers need elevated memlock.
+LimitMEMLOCK=infinity
+# High-connection scenarios need many open file descriptors.
+LimitNOFILE=1048576
+
+# ── Capabilities ──────────────────────────────────────────────────────
+# SQPOLL (optional, config: sqpoll=true) needs CAP_SYS_NICE to set the
+# kernel polling thread's scheduler priority.
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+
+# ── Hardening ─────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vireon /var/log/vireon
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
