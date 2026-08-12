@@ -1,0 +1,34 @@
+[Unit]
+Description=Vireon CLI subscriber (%i)
+Documentation=https://github.com/vireon-duplex/vireon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vireon
+Group=vireon
+
+# Per-instance config: /etc/vireon/subscribers/<name>.conf
+# Must define PATTERN and FORMAT (see subscriber.example.conf).
+EnvironmentFile=/etc/vireon/subscribers/%i.conf
+
+ExecStart=/usr/local/bin/vireon sub "${PATTERN}" --format "${FORMAT}"
+Restart=on-failure
+RestartSec=2
+
+# ── Hardening ─────────────────────────────────────────────────────────
+# Less strict than the server unit: the CLI uses tokio UDP (no io_uring),
+# so no special capabilities or memlock limits are needed.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/vireon
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
