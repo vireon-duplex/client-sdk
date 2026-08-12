@@ -1,0 +1,31 @@
+[package]
+name = "vireon-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Redis-cli-style CLI for the Vireon QUIC pub/sub runtime."
+readme = "README.md"
+
+[[bin]]
+name = "vireon"
+path = "src/main.rs"
+
+[dependencies]
+vireon-sdk = { path = "../client-sdk" }
+
+# CLI argument parsing.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime. Need `signal` for ctrl_c, `io-util` for stdin read_to_end.
+tokio = { workspace = true, features = ["signal", "io-util"] }
+
+# Structured logging (suppressed by default — CLI is for humans).
+tracing = { workspace = true }
+
+# Byte payloads.
+bytes = { workspace = true }
+
+[lints]
+workspace = true
